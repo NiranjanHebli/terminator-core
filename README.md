@@ -40,11 +40,3 @@ make clean
 ```bash
 ./terminal
 ```
-
----
-
-## Features
-
-- Creates an X11 window using Xlib.
-- Displays an editable `"Hello World"` text buffer.
-- Handles keyboard input (`KeyPress`) and backspace (`XK_BackSpace`).
