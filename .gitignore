@@ -1,0 +1,56 @@
+# ==============================================================================
+# Terminator - .gitignore
+# CS69201 Computing Lab Term Project
+# ==============================================================================
+
+# Assignment Folder
+assignment/
+
+# Compiled Binaries & Executables
+terminator
+terminal
+terminal_cocoa
+*.exe
+*.out
+*.app
+
+# Object files & Libraries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# Debug Symbols
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Operating System Metadata
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor & IDE configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# Compilation Databases & Diagnostic Logs
+compile_commands.json
+*.log
+*.tmp
+
+# Temporary Test Artifacts
+test_output.txt
+in.txt
+out.txt
+*.test
