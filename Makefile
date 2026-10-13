@@ -1,7 +1,6 @@
 CC ?= gcc
 CFLAGS = -Wall -Wextra -std=c11
 
-# OS detection for X11 flags
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     CFLAGS += -I/opt/homebrew/include

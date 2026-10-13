@@ -7,13 +7,15 @@
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <sys/wait.h>
 #include <sys/types.h>
+#include <errno.h>
 
 #define MAX_TABS 10
 #define MAX_LINES 1000
 #define MAX_LINE_LEN 256
 #define TAB_BAR_HEIGHT 32
-#define TAB_WIDTH 120
+#define TAB_WIDTH 110
 #define ADD_BTN_WIDTH 36
 
 typedef struct {
@@ -97,7 +99,6 @@ static void create_tab(void) {
     int out_pipe[2];
     if (pipe(in_pipe) < 0 || pipe(out_pipe) < 0) return;
 
-    int new_id = tab_count + 1;
     pid_t pid = fork();
     if (pid < 0) return;
 
@@ -106,18 +107,93 @@ static void create_tab(void) {
         close(out_pipe[0]);
         dup2(in_pipe[0], STDIN_FILENO);
         dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(out_pipe[1], STDERR_FILENO);
         close(in_pipe[0]);
         close(out_pipe[1]);
 
         char line[1024];
+        int last_status = 0;
         while (fgets(line, sizeof(line), stdin)) {
             size_t len = strlen(line);
             while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
                 line[--len] = '\0';
             }
             if (len == 0) continue;
-            printf("[tab %d pid %d] %s\n", new_id, getpid(), line);
-            fflush(stdout);
+
+            char *argv[64];
+            int argc = 0;
+            char *tok = strtok(line, " \t");
+            while (tok && argc < 63) {
+                argv[argc++] = tok;
+                tok = strtok(NULL, " \t");
+            }
+            argv[argc] = NULL;
+            if (argc == 0) continue;
+
+            /* Expand $? in arguments */
+            char status_str[16];
+            snprintf(status_str, sizeof(status_str), "%d", last_status);
+            for (int i = 0; i < argc; i++) {
+                if (strcmp(argv[i], "$?") == 0) {
+                    argv[i] = status_str;
+                }
+            }
+
+            if (strcmp(argv[0], "cd") == 0) {
+                const char *dest = (argc > 1) ? argv[1] : getenv("HOME");
+                char path_buf[1024];
+                if (dest && strcmp(dest, "~") == 0) {
+                    dest = getenv("HOME");
+                } else if (dest && strncmp(dest, "~/", 2) == 0) {
+                    const char *home = getenv("HOME");
+                    if (home) {
+                        snprintf(path_buf, sizeof(path_buf), "%s%s", home, dest + 1);
+                        dest = path_buf;
+                    }
+                }
+                if (!dest) dest = "/";
+
+                if (chdir(dest) == 0) {
+                    char cwd[128];
+                    if (getcwd(cwd, sizeof(cwd))) {
+                        printf("[cwd: %s]\n", cwd);
+                    }
+                    last_status = 0;
+                } else {
+                    perror("cd");
+                    last_status = 1;
+                }
+                fflush(stdout);
+                fflush(stderr);
+                continue;
+            }
+
+            if (strcmp(argv[0], "exit") == 0) {
+                int exit_code = (argc > 1) ? atoi(argv[1]) : last_status;
+                _exit(exit_code);
+            }
+
+            pid_t cpid = fork();
+            if (cpid == 0) {
+                execvp(argv[0], argv);
+                fprintf(stderr, "terminator: %s: command not found\n", argv[0]);
+                _exit(127);
+            } else if (cpid > 0) {
+                int status = 0;
+                waitpid(cpid, &status, 0);
+                if (WIFEXITED(status)) {
+                    last_status = WEXITSTATUS(status);
+                } else if (WIFSIGNALED(status)) {
+                    last_status = 128 + WTERMSIG(status);
+                } else {
+                    last_status = 1;
+                }
+                fflush(stdout);
+                fflush(stderr);
+            } else {
+                perror("fork");
+                last_status = 1;
+            }
         }
         _exit(0);
     }
@@ -127,7 +203,7 @@ static void create_tab(void) {
     fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
 
     Tab *t = &tabs[tab_count];
-    t->id = new_id;
+    t->id = tab_count + 1;
     t->pid = pid;
     t->in_fd = in_pipe[1];
     t->out_fd = out_pipe[0];
@@ -137,7 +213,7 @@ static void create_tab(void) {
     t->line_count = 0;
 
     char welcome[128];
-    snprintf(welcome, sizeof(welcome), "Terminator Tab %d (Process PID: %d active)\n", t->id, pid);
+    snprintf(welcome, sizeof(welcome), "Terminator Tab %d (PID: %d ready)\n", t->id, pid);
     tab_append_text(t, welcome, strlen(welcome));
 
     active_tab = tab_count;
@@ -278,12 +354,28 @@ int main(void) {
             int cur_idx = 1;
             for (int i = 0; i < tab_count; i++) {
                 if (tabs[i].out_fd >= 0) {
-                    if (pfds[cur_idx].revents & POLLIN) {
+                    if (pfds[cur_idx].revents & (POLLIN | POLLHUP | POLLERR)) {
                         char buf[1024];
                         ssize_t n = read(tabs[i].out_fd, buf, sizeof(buf) - 1);
                         if (n > 0) {
                             buf[n] = '\0';
                             tab_append_text(&tabs[i], buf, n);
+                            if (strstr(buf, "[cwd: ")) {
+                                char *p = strstr(buf, "[cwd: ") + 6;
+                                char *end = strchr(p, ']');
+                                if (end) {
+                                    *end = '\0';
+                                    char *slash = strrchr(p, '/');
+                                    const char *bname = (slash && *(slash + 1)) ? slash + 1 : p;
+                                    snprintf(tabs[i].title, sizeof(tabs[i].title), "%d: %s", tabs[i].id, bname);
+                                }
+                            }
+                            redraw(win_w, win_h);
+                        } else if (n == 0) {
+                            close(tabs[i].out_fd);
+                            tabs[i].out_fd = -1;
+                            const char *closed_msg = "[Process exited]\n";
+                            tab_append_text(&tabs[i], closed_msg, strlen(closed_msg));
                             redraw(win_w, win_h);
                         }
                     }
