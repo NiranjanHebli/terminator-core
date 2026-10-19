@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -11,6 +12,15 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <ctype.h>
+#include <limits.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <strings.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #define MAX_TABS 10
 #define MAX_LINES 1000
@@ -30,6 +40,8 @@ typedef struct {
     int input_len;
     char pending[MAX_CMD_LEN];   /* earlier lines of an unfinished multiline command */
     int pending_len;
+    int hist_pos;                /* 0 = editing a fresh line, k = k-th most recent command */
+    char saved_input[1024];      /* the half-typed line while browsing history */
     char lines[MAX_LINES][MAX_LINE_LEN];
     int line_count;
 } Tab;
@@ -118,8 +130,205 @@ enum {
     NEED_PAREN       /* unterminated $( ... )         */
 };
 
-static int last_status = 0;   /* $? */
-static int in_subshell = 0;   /* inside $(...): do not announce cd to the GUI */
+#define MAX_HISTORY 10000
+#define MAX_HIST_LEN 1024
+#define MULTIWATCH_MAX 32
+#define MW_SEPARATOR "----------------------------------------------------"
+
+/* ---- Act 4: state shared by every tab (history, clipboard) ----
+ * Thread mode : plain heap memory guarded by a pthread mutex.
+ * Process mode: POSIX shared memory (shm_open + mmap) guarded by a POSIX
+ *               semaphore (sem_open), because tabs are separate processes. */
+typedef struct {
+    long total;                          /* commands ever added; entry n lives in slot n % MAX_HISTORY */
+    char history[MAX_HISTORY][MAX_HIST_LEN];
+    char clipboard[4096];
+} SharedState;
+
+static int use_process_mode = 0;
+static SharedState *shared_state = NULL;
+static pthread_mutex_t shared_mutex = PTHREAD_MUTEX_INITIALIZER;
+static sem_t *shared_sem = SEM_FAILED;
+
+/* ---- state that is private to one tab ----
+ * Thread-local so that tabs running as threads of one process never see
+ * each other's status, directory or descriptors. In process mode each tab is
+ * its own process and these are simply that process's variables. */
+static _Thread_local int last_status = 0;       /* $? */
+static _Thread_local int in_subshell = 0;       /* inside $(...) or multiWatch: no cwd announce, no new pgroups */
+static _Thread_local int shell_exit_requested = 0;
+static _Thread_local int shell_exit_code = 0;
+static _Thread_local int tab_in_fd = -1;        /* the tab's keyboard line pipe */
+static _Thread_local int tab_out_fd = -1;       /* where diagnostics and the prompt text go */
+static _Thread_local int cur_stdout_fd = -1;    /* where command output goes */
+static _Thread_local char tab_cwd[PATH_MAX];    /* chdir() is process-wide, so each tab tracks its own cwd */
+
+static void write_all(int fd, const char *s, size_t n) {
+    while (n > 0) {
+        ssize_t w = write(fd, s, n);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        s += w;
+        n -= (size_t)w;
+    }
+}
+
+static void sh_err(const char *fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    write_all(tab_out_fd, buf, strlen(buf));
+}
+
+static void sh_out(const char *fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    write_all(cur_stdout_fd, buf, strlen(buf));
+}
+
+static int shared_init(void) {
+    if (!use_process_mode) {
+        shared_state = calloc(1, sizeof(SharedState));
+        return shared_state ? 0 : -1;
+    }
+    char shm_name[64], sem_name[64];
+    snprintf(shm_name, sizeof(shm_name), "/trm_shm_%d", (int)getpid());
+    snprintf(sem_name, sizeof(sem_name), "/trm_sem_%d", (int)getpid());
+
+    int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) return -1;
+    if (ftruncate(fd, sizeof(SharedState)) < 0) {
+        close(fd);
+        shm_unlink(shm_name);
+        return -1;
+    }
+    shm_unlink(shm_name);   /* the mapping stays alive; nothing is left behind in the system */
+    void *m = mmap(NULL, sizeof(SharedState), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return -1;
+    shared_state = m;
+
+    shared_sem = sem_open(sem_name, O_CREAT | O_EXCL, 0600, 1);
+    if (shared_sem == SEM_FAILED) return -1;
+    sem_unlink(sem_name);
+    return 0;
+}
+
+static void shared_lock(void) {
+    if (use_process_mode) {
+        while (sem_wait(shared_sem) < 0 && errno == EINTR) {}
+    } else {
+        pthread_mutex_lock(&shared_mutex);
+    }
+}
+
+static void shared_unlock(void) {
+    if (use_process_mode) {
+        sem_post(shared_sem);
+    } else {
+        pthread_mutex_unlock(&shared_mutex);
+    }
+}
+
+static void history_add(const char *cmd) {
+    const char *p = cmd;
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+    if (!*p || !shared_state) return;
+    shared_lock();
+    char *slot = shared_state->history[shared_state->total % MAX_HISTORY];
+    size_t n = 0;
+    for (; cmd[n] && n < MAX_HIST_LEN - 1; n++) slot[n] = (cmd[n] == '\n') ? ' ' : cmd[n];
+    slot[n] = '\0';
+    shared_state->total++;
+    shared_unlock();
+}
+
+static long history_total(void) {
+    shared_lock();
+    long total = shared_state->total;
+    shared_unlock();
+    return total;
+}
+
+/* n is an absolute, zero-based command number. Returns 0 if it is gone. */
+static int history_get_abs(long n, char *out, size_t cap) {
+    int ok = 0;
+    shared_lock();
+    long total = shared_state->total;
+    long first = total > MAX_HISTORY ? total - MAX_HISTORY : 0;
+    if (n >= first && n < total) {
+        snprintf(out, cap, "%s", shared_state->history[n % MAX_HISTORY]);
+        ok = 1;
+    }
+    shared_unlock();
+    return ok;
+}
+
+/* back = 1 is the most recent command. Returns 0 if there is no such entry. */
+static int history_get_back(long back, char *out, size_t cap) {
+    if (back < 1) return 0;
+    return history_get_abs(history_total() - back, out, cap);
+}
+
+static void print_history(int fd) {
+    long total = history_total();
+    long first = total > MAX_HISTORY ? total - MAX_HISTORY : 0;
+    char entry[MAX_HIST_LEN];
+    char line[MAX_HIST_LEN + 32];
+    for (long n = first; n < total; n++) {
+        if (!history_get_abs(n, entry, sizeof(entry))) continue;
+        int l = snprintf(line, sizeof(line), "%5ld  %s\n", n + 1, entry);
+        write_all(fd, line, (size_t)l);
+    }
+}
+
+/* ---- per-tab working directory ---- */
+static const char *resolve_path(const char *p, char *buf, size_t cap) {
+    if (p[0] == '/') return p;
+    snprintf(buf, cap, "%s/%s", tab_cwd, p);
+    return buf;
+}
+
+static int do_cd(const char *dest) {
+    char joined[PATH_MAX * 2], resolved[PATH_MAX];
+    struct stat st;
+    const char *path = resolve_path(dest, joined, sizeof(joined));
+    if (!realpath(path, resolved)) {
+        sh_err("terminator: cd: %s: %s\n", dest, strerror(errno));
+        return 1;
+    }
+    if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        sh_err("terminator: cd: %s: Not a directory\n", dest);
+        return 1;
+    }
+    if (access(resolved, X_OK) != 0) {
+        sh_err("terminator: cd: %s: %s\n", dest, strerror(errno));
+        return 1;
+    }
+    snprintf(tab_cwd, sizeof(tab_cwd), "%s", resolved);
+    return 0;
+}
+
+/* Common setup for every forked child: this tab's cwd and descriptors, and
+ * default signal behaviour (the GUI ignores SIGPIPE; programs must not). */
+static void child_setup(void) {
+    signal(SIGPIPE, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
+    int rc = chdir(tab_cwd);
+    (void)rc;
+    dup2(tab_in_fd, STDIN_FILENO);
+    dup2(cur_stdout_fd, STDOUT_FILENO);
+    dup2(tab_out_fd, STDERR_FILENO);
+}
+
+static int multi_watch(const char *args);
 
 static int scan_unit(const char *s, size_t *i, int in_paren);
 
@@ -265,9 +474,11 @@ static char *command_substitution(const char *cmd) {
     }
     if (pid == 0) {
         close(fds[0]);
-        dup2(fds[1], STDOUT_FILENO);
-        close(fds[1]);
         in_subshell = 1;
+        cur_stdout_fd = fds[1];
+        child_setup();
+        close(fds[1]);
+        cur_stdout_fd = STDOUT_FILENO;
         execute_line(cmd);
         fflush(NULL);
         _exit(last_status);
@@ -460,6 +671,16 @@ static const char *op_name(int type) {
 
 /* Parse, expand and run one complete command line. Returns its status. */
 static int execute_line(const char *line) {
+    /* multiWatch ["cmd1", "cmd2"] has its own list syntax, so it is
+     * recognised before the normal tokenizer sees the quotes. */
+    const char *mw = line;
+    while (*mw == ' ' || *mw == '\t') mw++;
+    if (strncmp(mw, "multiWatch", 10) == 0 &&
+        (mw[10] == '\0' || mw[10] == ' ' || mw[10] == '\t' || mw[10] == '[')) {
+        last_status = multi_watch(mw + 10);
+        return last_status;
+    }
+
     TokenList tl = {0};
     tokenize(line, &tl);
 
@@ -477,14 +698,14 @@ static int execute_line(const char *line) {
         int s = num_cmds - 1;
         if (tk->type == TOK_WORD) {
             if (stage_argc[s] >= MAX_ARGS) {
-                fprintf(stderr, "terminator: too many arguments\n");
+                sh_err("terminator: too many arguments\n");
                 parse_err = 1;
             } else {
                 stage_argv[s][stage_argc[s]++] = tk->text;
             }
         } else if (tk->type == TOK_PIPE) {
             if (stage_argc[s] == 0 || num_cmds >= MAX_STAGES) {
-                fprintf(stderr, "terminator: syntax error near unexpected token '|'\n");
+                sh_err("terminator: syntax error near unexpected token '|'\n");
                 parse_err = 1;
             } else {
                 num_cmds++;
@@ -492,7 +713,7 @@ static int execute_line(const char *line) {
         } else {
             /* <, > or >>: next token must be a word naming the file */
             if (t + 1 >= tl.count || tl.items[t + 1].type != TOK_WORD) {
-                fprintf(stderr, "terminator: syntax error near unexpected token '%s'\n",
+                sh_err("terminator: syntax error near unexpected token '%s'\n",
                         t + 1 < tl.count ? op_name(tl.items[t + 1].type) : "newline");
                 parse_err = 1;
             } else {
@@ -507,7 +728,7 @@ static int execute_line(const char *line) {
         }
     }
     if (!parse_err && num_cmds > 1 && stage_argc[num_cmds - 1] == 0) {
-        fprintf(stderr, "terminator: syntax error near unexpected token '|'\n");
+        sh_err("terminator: syntax error near unexpected token '|'\n");
         parse_err = 1;
     }
     for (int s = 0; s < num_cmds; s++) stage_argv[s][stage_argc[s]] = NULL;
@@ -523,14 +744,15 @@ static int execute_line(const char *line) {
      * bash does. Nothing is rewired in the shell itself. */
     if (stage_argc[0] == 0) {
         int rc = 0;
+        char pbuf[PATH_MAX * 2];
         if (tl.count == 0) {                /* blank line: status unchanged */
             tok_free(&tl);
             return last_status;
         }
         if (infile[0]) {
-            int ifd = open(infile[0], O_RDONLY);
+            int ifd = open(resolve_path(infile[0], pbuf, sizeof(pbuf)), O_RDONLY);
             if (ifd < 0) {
-                fprintf(stderr, "terminator: %s: %s\n", infile[0], strerror(errno));
+                sh_err("terminator: %s: %s\n", infile[0], strerror(errno));
                 rc = 1;
             } else {
                 close(ifd);
@@ -538,9 +760,9 @@ static int execute_line(const char *line) {
         }
         if (rc == 0 && outfile[0]) {
             int flags = O_WRONLY | O_CREAT | (append_mode[0] ? O_APPEND : O_TRUNC);
-            int ofd = open(outfile[0], flags, 0644);
+            int ofd = open(resolve_path(outfile[0], pbuf, sizeof(pbuf)), flags, 0644);
             if (ofd < 0) {
-                fprintf(stderr, "terminator: %s: %s\n", outfile[0], strerror(errno));
+                sh_err("terminator: %s: %s\n", outfile[0], strerror(errno));
                 rc = 1;
             } else {
                 close(ofd);
@@ -571,26 +793,21 @@ static int execute_line(const char *line) {
             }
             if (!dest) dest = "/";
 
-            if (chdir(dest) == 0) {
-                char cwd[128];
-                if (!in_subshell && getcwd(cwd, sizeof(cwd))) {
-                    printf("[cwd: %s]\n", cwd);
-                }
-                last_status = 0;
-            } else {
-                perror("cd");
-                last_status = 1;
-            }
-            fflush(stdout);
-            fflush(stderr);
+            last_status = do_cd(dest);
+            if (last_status == 0 && !in_subshell) sh_out("[cwd: %s]\n", tab_cwd);
             tok_free(&tl);
             return last_status;
         }
 
         if (strcmp(argv[0], "exit") == 0) {
             int exit_code = (argc > 1) ? atoi(argv[1]) : last_status;
-            fflush(NULL);
-            _exit(exit_code);
+            /* A tab may be a thread, so exit must not take the whole app down:
+             * just stop this tab's shell loop. */
+            last_status = exit_code;
+            shell_exit_code = exit_code;
+            shell_exit_requested = 1;
+            tok_free(&tl);
+            return last_status;
         }
     }
 
@@ -598,7 +815,7 @@ static int execute_line(const char *line) {
     int pipes[MAX_STAGES][2];
     for (int i = 0; i < num_cmds - 1; i++) {
         if (pipe(pipes[i]) < 0) {
-            perror("pipe");
+            sh_err("terminator: pipe: %s\n", strerror(errno));
             for (int j = 0; j < i; j++) {
                 close(pipes[j][0]);
                 close(pipes[j][1]);
@@ -617,16 +834,22 @@ static int execute_line(const char *line) {
     for (int s = 0; s < num_cmds; s++) {
         cpid[s] = fork();
         if (cpid[s] < 0) {
-            perror("fork");
+            sh_err("terminator: fork: %s\n", strerror(errno));
             break;
         }
 
         if (cpid[s] == 0) {
-            /* Child process group management (Slide 16) */
-            if (s == 0) {
-                setpgid(0, 0);
-            } else {
-                setpgid(0, pgid);
+            child_setup();
+
+            /* Child process group management (Slide 16). Inside a subshell
+             * (multiWatch, $(...)) stay in the subshell's group so one kill
+             * reaches every process it started. */
+            if (!in_subshell) {
+                if (s == 0) {
+                    setpgid(0, 0);
+                } else {
+                    setpgid(0, pgid);
+                }
             }
 
             /* Connect pipeline stdin/stdout (Slide 16) */
@@ -647,7 +870,7 @@ static int execute_line(const char *line) {
             if (infile[s]) {
                 int ifd = open(infile[s], O_RDONLY);
                 if (ifd < 0) {
-                    fprintf(stderr, "terminator: %s: %s\n", infile[s], strerror(errno));
+                    sh_err("terminator: %s: %s\n", infile[s], strerror(errno));
                     _exit(1);
                 }
                 dup2(ifd, STDIN_FILENO);
@@ -659,7 +882,7 @@ static int execute_line(const char *line) {
                 int flags = O_WRONLY | O_CREAT | (append_mode[s] ? O_APPEND : O_TRUNC);
                 int ofd = open(outfile[s], flags, 0644);
                 if (ofd < 0) {
-                    fprintf(stderr, "terminator: %s: %s\n", outfile[s], strerror(errno));
+                    sh_err("terminator: %s: %s\n", outfile[s], strerror(errno));
                     _exit(1);
                 }
                 dup2(ofd, STDOUT_FILENO);
@@ -673,9 +896,14 @@ static int execute_line(const char *line) {
             if (strcmp(stage_argv[s][0], "cd") == 0) {
                 _exit(0);
             }
+            /* history runs here (not in the parent) so it can be piped and redirected */
+            if (strcmp(stage_argv[s][0], "history") == 0) {
+                print_history(STDOUT_FILENO);
+                _exit(0);
+            }
 
             execvp(stage_argv[s][0], stage_argv[s]);
-            fprintf(stderr, "terminator: %s: command not found\n", stage_argv[s][0]);
+            sh_err("terminator: %s: command not found\n", stage_argv[s][0]);
             _exit(127);
         }
 
@@ -683,7 +911,7 @@ static int execute_line(const char *line) {
         if (s == 0) {
             pgid = cpid[0];
         }
-        setpgid(cpid[s], pgid);
+        if (!in_subshell) setpgid(cpid[s], pgid);
         started++;
     }
 
@@ -712,23 +940,238 @@ static int execute_line(const char *line) {
     return last_status;
 }
 
-/* Read physical lines from stdin; keep reading (the "> " prompt in the GUI)
- * until the accumulated text is a complete command, then execute it. */
+/* ---- multiWatch (Act 4): many commands, one view ---- */
+
+/* Parse `["cmd1", "cmd2", ...]`. Returns 0 on success; *n is how many
+ * strings were stored (heap copies the caller must free), even on failure. */
+static int parse_multiwatch(const char *s, char *cmds[], int *n) {
+    *n = 0;
+    while (isspace((unsigned char)*s)) s++;
+    if (*s != '[') return -1;
+    s++;
+    for (;;) {
+        while (isspace((unsigned char)*s)) s++;
+        if (*s == ']') {
+            s++;
+            break;
+        }
+        if (*s != '"' && *s != '\'') return -1;
+        char q = *s++;
+        Str w = {0};
+        while (*s && *s != q) {
+            if (q == '"' && *s == '\\' && (s[1] == '"' || s[1] == '\\')) s++;
+            str_putc(&w, *s++);
+        }
+        if (*s != q || *n >= MULTIWATCH_MAX) {
+            free(w.data);
+            return -1;
+        }
+        s++;
+        cmds[(*n)++] = w.data ? w.data : empty_str();
+        while (isspace((unsigned char)*s)) s++;
+        if (*s == ',') {
+            s++;
+            continue;
+        }
+        if (*s == ']') {
+            s++;
+            break;
+        }
+        return -1;
+    }
+    while (isspace((unsigned char)*s)) s++;
+    return (*s == '\0' && *n > 0) ? 0 : -1;
+}
+
+static void multiwatch_print(const char *cmd, const char *data, ssize_t len) {
+    char head[2 * MAX_HIST_LEN + 128];
+    int h = snprintf(head, sizeof(head), "\"%s\", %ld:\n%s\n", cmd, (long)time(NULL), MW_SEPARATOR);
+    if (h > (int)sizeof(head) - 1) h = (int)sizeof(head) - 1;
+    write_all(cur_stdout_fd, head, (size_t)h);
+    write_all(cur_stdout_fd, data, (size_t)len);
+    if (len > 0 && data[len - 1] != '\n') write_all(cur_stdout_fd, "\n", 1);
+    write_all(cur_stdout_fd, MW_SEPARATOR "\n", strlen(MW_SEPARATOR) + 1);
+}
+
+/* One pipe() + fork() per command, stdout (and stderr) onto the pipe, then a
+ * single poll() over every read end plus the tab's input, where a 0x03 byte
+ * (Ctrl+C sent by the GUI) means "kill every child". */
+static int multi_watch(const char *args) {
+    char *cmds[MULTIWATCH_MAX];
+    int n = 0;
+    if (parse_multiwatch(args, cmds, &n) != 0) {
+        for (int i = 0; i < n; i++) free(cmds[i]);
+        sh_err("terminator: usage: multiWatch [\"cmd1\", \"cmd2\", ...]\n");
+        return 2;
+    }
+
+    int fds[MULTIWATCH_MAX];
+    pid_t pids[MULTIWATCH_MAX];
+    int open_count = 0;
+
+    fflush(NULL);
+    for (int i = 0; i < n; i++) {
+        int pp[2];
+        fds[i] = -1;
+        pids[i] = -1;
+        if (pipe(pp) < 0) {
+            sh_err("terminator: pipe: %s\n", strerror(errno));
+            continue;
+        }
+        pid_t pid = fork();
+        if (pid < 0) {
+            sh_err("terminator: fork: %s\n", strerror(errno));
+            close(pp[0]);
+            close(pp[1]);
+            continue;
+        }
+        if (pid == 0) {
+            setpgid(0, 0);
+            close(pp[0]);
+            for (int j = 0; j < i; j++) {
+                if (fds[j] >= 0) close(fds[j]);
+            }
+            in_subshell = 1;
+            cur_stdout_fd = pp[1];
+            tab_out_fd = pp[1];
+            child_setup();
+            close(pp[1]);
+            cur_stdout_fd = STDOUT_FILENO;
+            tab_out_fd = STDOUT_FILENO;
+            execute_line(cmds[i]);
+            _exit(last_status);
+        }
+        close(pp[1]);
+        setpgid(pid, pid);
+        fds[i] = pp[0];
+        pids[i] = pid;
+        open_count++;
+    }
+
+    int cancelled = 0;
+    int input_open = 1;   /* stop watching the tab input once it hits EOF */
+    while (open_count > 0 && !cancelled) {
+        struct pollfd pf[MULTIWATCH_MAX + 1];
+        int idx[MULTIWATCH_MAX];
+        int np = 0;
+        for (int i = 0; i < n; i++) {
+            if (fds[i] >= 0) {
+                pf[np].fd = fds[i];
+                pf[np].events = POLLIN;
+                pf[np].revents = 0;
+                idx[np++] = i;
+            }
+        }
+        pf[np].fd = input_open ? tab_in_fd : -1;
+        pf[np].events = POLLIN;
+        pf[np].revents = 0;
+
+        if (poll(pf, (nfds_t)(np + 1), -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        for (int k = 0; k < np; k++) {
+            if (!(pf[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            int i = idx[k];
+            char buf[4096];
+            ssize_t got = read(fds[i], buf, sizeof(buf));
+            if (got > 0) {
+                multiwatch_print(cmds[i], buf, got);
+            } else if (got == 0 || (errno != EINTR && errno != EAGAIN)) {
+                close(fds[i]);
+                fds[i] = -1;
+                open_count--;
+            }
+        }
+        if (pf[np].revents & (POLLIN | POLLHUP | POLLERR)) {
+            char cb[64];
+            ssize_t got = read(tab_in_fd, cb, sizeof(cb));
+            if (got <= 0) {
+                input_open = 0;
+            } else {
+                for (ssize_t k = 0; k < got; k++) {
+                    if (cb[k] == 3) cancelled = 1;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (fds[i] >= 0) close(fds[i]);
+        if (cancelled && pids[i] > 0) {
+            if (kill(-pids[i], SIGINT) < 0) kill(pids[i], SIGINT);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (pids[i] > 0) waitpid(pids[i], NULL, 0);
+        free(cmds[i]);
+    }
+    return cancelled ? 130 : 0;
+}
+
+/* ---- reading a tab's input ---- */
+typedef struct {
+    char buf[4096];
+    size_t pos, len;
+} LineReader;
+
+/* Read one physical line from fd. Returns its length, or -1 at end of input.
+ * A 0x03 byte (Ctrl+C sent by the GUI, since there is no TTY) throws away
+ * the partial line and sets *interrupted so the caller drops any
+ * unfinished multiline command too. */
+static int read_line(LineReader *r, int fd, char *line, size_t cap, int *interrupted) {
+    size_t n = 0;
+    *interrupted = 0;
+    for (;;) {
+        if (r->pos == r->len) {
+            ssize_t got = read(fd, r->buf, sizeof(r->buf));
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) {
+                if (n > 0) {
+                    line[n] = '\0';
+                    return (int)n;
+                }
+                return -1;
+            }
+            r->pos = 0;
+            r->len = (size_t)got;
+        }
+        char c = r->buf[r->pos++];
+        if (c == 3) {
+            n = 0;
+            *interrupted = 1;
+        } else if (c == '\n') {
+            line[n] = '\0';
+            return (int)n;
+        } else if (n < cap - 1) {
+            line[n++] = c;
+        }
+    }
+}
+
+/* Read physical lines from the tab's input; keep reading (the "> " prompt in
+ * the GUI) until the accumulated text is a complete command, then record it
+ * in the shared history and execute it. */
 static void run_shell(void) {
     char line[1024];
-    static char cmd[MAX_CMD_LEN];
+    static _Thread_local char cmd[MAX_CMD_LEN];
     size_t cmd_len = 0;
+    LineReader rd = {.pos = 0, .len = 0};
+    int interrupted = 0;
+    int n;
 
-    while (fgets(line, sizeof(line), stdin)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
+    cmd[0] = '\0';
+    while (!shell_exit_requested && (n = read_line(&rd, tab_in_fd, line, sizeof(line), &interrupted)) >= 0) {
+        size_t len = (size_t)n;
+        while (len > 0 && line[len - 1] == '\r') line[--len] = '\0';
+        if (interrupted) {
+            cmd_len = 0;
+            cmd[0] = '\0';
         }
         if (len == 0 && cmd_len == 0) continue;
 
         if (cmd_len + len + 2 > sizeof(cmd)) {
-            fprintf(stderr, "terminator: command too long\n");
-            fflush(stderr);
+            sh_err("terminator: command too long\n");
             cmd_len = 0;
             cmd[0] = '\0';
             last_status = 1;
@@ -740,15 +1183,41 @@ static void run_shell(void) {
 
         if (input_status(cmd) != INPUT_COMPLETE) continue;   /* need more input */
 
+        history_add(cmd);
         execute_line(cmd);
         cmd_len = 0;
         cmd[0] = '\0';
     }
 
-    if (cmd_len > 0) {
-        fprintf(stderr, "terminator: syntax error: unexpected end of input\n");
-        fflush(stderr);
+    if (cmd_len > 0 && !shell_exit_requested) {
+        sh_err("terminator: syntax error: unexpected end of input\n");
     }
+}
+
+/* ---- tabs: one shell per tab, as a thread or as a process ---- */
+
+/* Everything a tab does once it owns its descriptors. */
+static void tab_main(int in_fd, int out_fd) {
+    tab_in_fd = in_fd;
+    tab_out_fd = out_fd;
+    cur_stdout_fd = out_fd;
+    last_status = 0;
+    if (!getcwd(tab_cwd, sizeof(tab_cwd))) snprintf(tab_cwd, sizeof(tab_cwd), "/");
+    run_shell();
+    close(in_fd);
+    close(out_fd);
+}
+
+typedef struct {
+    int in_fd;
+    int out_fd;
+} TabArgs;
+
+static void *tab_thread(void *arg) {
+    TabArgs a = *(TabArgs *)arg;
+    free(arg);
+    tab_main(a.in_fd, a.out_fd);
+    return NULL;
 }
 
 static void create_tab(void) {
@@ -756,26 +1225,61 @@ static void create_tab(void) {
 
     int in_pipe[2];
     int out_pipe[2];
-    if (pipe(in_pipe) < 0 || pipe(out_pipe) < 0) return;
-
-    pid_t pid = fork();
-    if (pid < 0) return;
-
-    if (pid == 0) {
+    if (pipe(in_pipe) < 0) return;
+    if (pipe(out_pipe) < 0) {
+        close(in_pipe[0]);
         close(in_pipe[1]);
-        close(out_pipe[0]);
-        dup2(in_pipe[0], STDIN_FILENO);
-        dup2(out_pipe[1], STDOUT_FILENO);
-        dup2(out_pipe[1], STDERR_FILENO);
+        return;
+    }
+    /* Programs started by a tab must never inherit the tab plumbing */
+    fcntl(in_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(in_pipe[1], F_SETFD, FD_CLOEXEC);
+    fcntl(out_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(out_pipe[1], F_SETFD, FD_CLOEXEC);
+
+    pid_t pid = 0;
+    if (use_process_mode) {
+        /* Process mode: the GUI is the parent, the tab is a forked child */
+        pid = fork();
+        if (pid < 0) {
+            close(in_pipe[0]);
+            close(in_pipe[1]);
+            close(out_pipe[0]);
+            close(out_pipe[1]);
+            return;
+        }
+        if (pid == 0) {
+            close(in_pipe[1]);
+            close(out_pipe[0]);
+            tab_main(in_pipe[0], out_pipe[1]);
+            _exit(shell_exit_requested ? shell_exit_code : 0);
+        }
         close(in_pipe[0]);
         close(out_pipe[1]);
-
-        run_shell();
-        _exit(0);
+    } else {
+        /* Thread mode: the tab is a thread; it owns the tab-side descriptors */
+        TabArgs *a = malloc(sizeof(*a));
+        pthread_t th;
+        if (!a) {
+            close(in_pipe[0]);
+            close(in_pipe[1]);
+            close(out_pipe[0]);
+            close(out_pipe[1]);
+            return;
+        }
+        a->in_fd = in_pipe[0];
+        a->out_fd = out_pipe[1];
+        if (pthread_create(&th, NULL, tab_thread, a) != 0) {
+            free(a);
+            close(in_pipe[0]);
+            close(in_pipe[1]);
+            close(out_pipe[0]);
+            close(out_pipe[1]);
+            return;
+        }
+        pthread_detach(th);
     }
 
-    close(in_pipe[0]);
-    close(out_pipe[1]);
     fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
 
     Tab *t = &tabs[tab_count];
@@ -788,10 +1292,16 @@ static void create_tab(void) {
     t->input_len = 0;
     t->pending[0] = '\0';
     t->pending_len = 0;
+    t->hist_pos = 0;
+    t->saved_input[0] = '\0';
     t->line_count = 0;
 
     char welcome[128];
-    snprintf(welcome, sizeof(welcome), "Terminator Tab %d (PID: %d ready)\n", t->id, pid);
+    if (use_process_mode) {
+        snprintf(welcome, sizeof(welcome), "Terminator Tab %d (process mode, PID: %d ready)\n", t->id, (int)pid);
+    } else {
+        snprintf(welcome, sizeof(welcome), "Terminator Tab %d (thread mode ready)\n", t->id);
+    }
     tab_append_text(t, welcome, strlen(welcome));
 
     active_tab = tab_count;
@@ -874,14 +1384,42 @@ static void redraw(int win_w, int win_h) {
 }
 
 int main(int argc, char **argv) {
-    /* Headless mode: run only the shell engine on stdin/stdout (for testing) */
-    if (argc > 1 && strcmp(argv[1], "--shell") == 0) {
-        run_shell();
-        return 0;
+    /* ./terminator              -> thread mode (default)
+     * ./terminator useProcess=True -> process mode */
+    int headless = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "useProcess=", 11) == 0) {
+            const char *v = argv[i] + 11;
+            use_process_mode = (strcasecmp(v, "true") == 0 || strcmp(v, "1") == 0);
+        } else if (strcmp(argv[i], "--shell") == 0) {
+            headless = 1;
+        }
     }
 
+    if (shared_init() != 0) {
+        fprintf(stderr, "terminator: cannot set up shared state: %s\n", strerror(errno));
+        return 1;
+    }
+
+    /* Headless mode: run only the shell engine on stdin/stdout (for testing) */
+    if (headless) {
+        tab_in_fd = STDIN_FILENO;
+        cur_stdout_fd = STDOUT_FILENO;
+        tab_out_fd = STDERR_FILENO;
+        if (!getcwd(tab_cwd, sizeof(tab_cwd))) snprintf(tab_cwd, sizeof(tab_cwd), "/");
+        run_shell();
+        return shell_exit_requested ? shell_exit_code : last_status;
+    }
+
+    /* A tab that exits must not kill the GUI when it next writes to it */
+    signal(SIGPIPE, SIG_IGN);
+
     dpy = XOpenDisplay(NULL);
-    if (!dpy) return 1;
+    if (!dpy) {
+        fprintf(stderr, "terminator: cannot open X display (is DISPLAY set?)\n");
+        return 1;
+    }
+    fcntl(ConnectionNumber(dpy), F_SETFD, FD_CLOEXEC);
 
     scr = DefaultScreen(dpy);
     col_bg = get_hex_color("#181825");
@@ -1006,6 +1544,37 @@ int main(int argc, char **argv) {
                 if ((ev.xkey.state & ControlMask) && (ks == XK_t || ks == XK_T)) {
                     create_tab();
                     redraw(win_w, win_h);
+                } else if ((ev.xkey.state & ControlMask) && (ks == XK_c || ks == XK_C)) {
+                    /* No TTY: the GUI tells the tab's shell to abandon the line
+                     * and stop any multiWatch (an ETX byte on its input). */
+                    tab_append_text(cur, "^C\n", 3);
+                    cur->input_len = 0;
+                    cur->input[0] = '\0';
+                    cur->pending_len = 0;
+                    cur->pending[0] = '\0';
+                    cur->hist_pos = 0;
+                    write_all(cur->in_fd, "\003", 1);
+                    redraw(win_w, win_h);
+                } else if (ks == XK_Up && cur->pending_len == 0) {
+                    /* History is shared: a command typed in any tab shows up here */
+                    char h[MAX_HIST_LEN];
+                    if (history_get_back(cur->hist_pos + 1, h, sizeof(h))) {
+                        if (cur->hist_pos == 0) snprintf(cur->saved_input, sizeof(cur->saved_input), "%s", cur->input);
+                        cur->hist_pos++;
+                        snprintf(cur->input, sizeof(cur->input), "%s", h);
+                        cur->input_len = (int)strlen(cur->input);
+                        redraw(win_w, win_h);
+                    }
+                } else if (ks == XK_Down && cur->pending_len == 0 && cur->hist_pos > 0) {
+                    char h[MAX_HIST_LEN];
+                    cur->hist_pos--;
+                    if (cur->hist_pos == 0) {
+                        snprintf(cur->input, sizeof(cur->input), "%s", cur->saved_input);
+                    } else if (history_get_back(cur->hist_pos, h, sizeof(h))) {
+                        snprintf(cur->input, sizeof(cur->input), "%s", h);
+                    }
+                    cur->input_len = (int)strlen(cur->input);
+                    redraw(win_w, win_h);
                 } else if (ks == XK_BackSpace) {
                     if (cur->input_len > 0) {
                         cur->input[--cur->input_len] = '\0';
@@ -1036,6 +1605,7 @@ int main(int argc, char **argv) {
 
                     cur->input_len = 0;
                     cur->input[0] = '\0';
+                    cur->hist_pos = 0;
                     redraw(win_w, win_h);
                 } else if (len > 0 && (unsigned char)kbuf[0] >= 32 && (unsigned char)kbuf[0] <= 126) {
                     if (cur->input_len < (int)sizeof(cur->input) - 2) {
