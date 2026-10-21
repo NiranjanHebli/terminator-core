@@ -43,6 +43,7 @@ typedef struct {
   int pending_len;
   int hist_pos; /* 0 = editing a fresh line, k = k-th most recent command */
   char saved_input[1024]; /* the half-typed line while browsing history */
+  int input_pos;          /* cursor position inside input */
   int slot;           /* index into the shared per-tab state (fg_pgid) */
   int closing;        /* Ctrl+D sent EOF: remove the tab once it has exited */
   int remove_pending; /* shell output hit EOF after closing */
@@ -1746,6 +1747,7 @@ static void create_tab(void) {
   snprintf(t->title, sizeof(t->title), "%d: tab", t->id);
   t->input[0] = '\0';
   t->input_len = 0;
+  t->input_pos = 0;
   t->slot = slot;
   t->closing = 0;
   t->remove_pending = 0;
@@ -1793,6 +1795,239 @@ static void close_tab(int idx) {
   tab_count--;
   if (active_tab >= tab_count)
     active_tab = tab_count > 0 ? tab_count - 1 : 0;
+}
+
+/* ---- hotkeys and ~/.terminatorrc bindings ---- */
+typedef enum {
+  ACT_NONE = 0,
+  ACT_MOVE_LEFT,
+  ACT_MOVE_RIGHT,
+  ACT_START_OF_LINE,
+  ACT_END_OF_LINE,
+  ACT_HIST_PREV,
+  ACT_HIST_NEXT,
+  ACT_DEL_TO_START,
+  ACT_DEL_TO_END,
+  ACT_DEL_WORD,
+  ACT_CLEAR_SCREEN,
+  ACT_CLOSE_TAB,
+  ACT_COPY,
+  ACT_PASTE,
+  ACT_NEW_TAB,
+  ACT_INTERRUPT,
+  ACT_SUSPEND,
+  ACT_COUNT
+} ActionId;
+
+typedef struct {
+  unsigned int mod;
+  KeySym sym;
+} KeyBinding;
+
+static KeyBinding bindings[ACT_COUNT];
+
+static void init_default_bindings(void) {
+  bindings[ACT_MOVE_LEFT] = (KeyBinding){0, XK_Left};
+  bindings[ACT_MOVE_RIGHT] = (KeyBinding){0, XK_Right};
+  bindings[ACT_START_OF_LINE] = (KeyBinding){ControlMask, XK_a};
+  bindings[ACT_END_OF_LINE] = (KeyBinding){ControlMask, XK_e};
+  bindings[ACT_HIST_PREV] = (KeyBinding){0, XK_Up};
+  bindings[ACT_HIST_NEXT] = (KeyBinding){0, XK_Down};
+  bindings[ACT_DEL_TO_START] = (KeyBinding){ControlMask, XK_u};
+  bindings[ACT_DEL_TO_END] = (KeyBinding){ControlMask, XK_k};
+  bindings[ACT_DEL_WORD] = (KeyBinding){ControlMask, XK_w};
+  bindings[ACT_CLEAR_SCREEN] = (KeyBinding){ControlMask, XK_l};
+  bindings[ACT_CLOSE_TAB] = (KeyBinding){ControlMask, XK_d};
+  bindings[ACT_COPY] = (KeyBinding){ControlMask | ShiftMask, XK_c};
+  bindings[ACT_PASTE] = (KeyBinding){ControlMask | ShiftMask, XK_v};
+  bindings[ACT_NEW_TAB] = (KeyBinding){ControlMask, XK_t};
+  bindings[ACT_INTERRUPT] = (KeyBinding){ControlMask, XK_c};
+  bindings[ACT_SUSPEND] = (KeyBinding){ControlMask, XK_z};
+}
+
+static ActionId parse_action_name(const char *name) {
+  if (strcasecmp(name, "move-left") == 0 ||
+      strcasecmp(name, "backward-char") == 0)
+    return ACT_MOVE_LEFT;
+  if (strcasecmp(name, "move-right") == 0 ||
+      strcasecmp(name, "forward-char") == 0)
+    return ACT_MOVE_RIGHT;
+  if (strcasecmp(name, "start-of-line") == 0 ||
+      strcasecmp(name, "beginning-of-line") == 0)
+    return ACT_START_OF_LINE;
+  if (strcasecmp(name, "end-of-line") == 0)
+    return ACT_END_OF_LINE;
+  if (strcasecmp(name, "browse-history-up") == 0 ||
+      strcasecmp(name, "history-prev") == 0 ||
+      strcasecmp(name, "previous-history") == 0 ||
+      strcasecmp(name, "history-up") == 0)
+    return ACT_HIST_PREV;
+  if (strcasecmp(name, "browse-history-down") == 0 ||
+      strcasecmp(name, "history-next") == 0 ||
+      strcasecmp(name, "next-history") == 0 ||
+      strcasecmp(name, "history-down") == 0)
+    return ACT_HIST_NEXT;
+  if (strcasecmp(name, "delete-to-start") == 0 ||
+      strcasecmp(name, "backward-kill-line") == 0)
+    return ACT_DEL_TO_START;
+  if (strcasecmp(name, "delete-to-end") == 0 ||
+      strcasecmp(name, "kill-line") == 0)
+    return ACT_DEL_TO_END;
+  if (strcasecmp(name, "delete-word") == 0 ||
+      strcasecmp(name, "delete-previous-word") == 0 ||
+      strcasecmp(name, "delete-prev-word") == 0 ||
+      strcasecmp(name, "backward-kill-word") == 0)
+    return ACT_DEL_WORD;
+  if (strcasecmp(name, "clear-screen") == 0 || strcasecmp(name, "clear") == 0)
+    return ACT_CLEAR_SCREEN;
+  if (strcasecmp(name, "close-tab") == 0 || strcasecmp(name, "send-eof") == 0 ||
+      strcasecmp(name, "eof") == 0)
+    return ACT_CLOSE_TAB;
+  if (strcasecmp(name, "copy") == 0)
+    return ACT_COPY;
+  if (strcasecmp(name, "paste") == 0)
+    return ACT_PASTE;
+  if (strcasecmp(name, "new-tab") == 0)
+    return ACT_NEW_TAB;
+  if (strcasecmp(name, "interrupt") == 0)
+    return ACT_INTERRUPT;
+  if (strcasecmp(name, "suspend") == 0)
+    return ACT_SUSPEND;
+  return ACT_NONE;
+}
+
+static int parse_key_combo(const char *str, KeyBinding *kb) {
+  kb->mod = 0;
+  kb->sym = NoSymbol;
+
+  char buf[128];
+  snprintf(buf, sizeof(buf), "%s", str);
+  char *saveptr = NULL;
+  char *tok = strtok_r(buf, "+", &saveptr);
+  while (tok) {
+    char *next = strtok_r(NULL, "+", &saveptr);
+    if (next) {
+      if (strcasecmp(tok, "ctrl") == 0 || strcasecmp(tok, "control") == 0) {
+        kb->mod |= ControlMask;
+      } else if (strcasecmp(tok, "shift") == 0) {
+        kb->mod |= ShiftMask;
+      } else if (strcasecmp(tok, "alt") == 0 || strcasecmp(tok, "mod1") == 0 ||
+                 strcasecmp(tok, "meta") == 0 || strcasecmp(tok, "opt") == 0 ||
+                 strcasecmp(tok, "option") == 0) {
+        kb->mod |= Mod1Mask;
+      } else {
+        return -1;
+      }
+    } else {
+      if (strcasecmp(tok, "left") == 0) {
+        kb->sym = XK_Left;
+      } else if (strcasecmp(tok, "right") == 0) {
+        kb->sym = XK_Right;
+      } else if (strcasecmp(tok, "up") == 0) {
+        kb->sym = XK_Up;
+      } else if (strcasecmp(tok, "down") == 0) {
+        kb->sym = XK_Down;
+      } else if (strcasecmp(tok, "backspace") == 0) {
+        kb->sym = XK_BackSpace;
+      } else if (strcasecmp(tok, "delete") == 0) {
+        kb->sym = XK_Delete;
+      } else if (strcasecmp(tok, "return") == 0 ||
+                 strcasecmp(tok, "enter") == 0) {
+        kb->sym = XK_Return;
+      } else if (strcasecmp(tok, "space") == 0) {
+        kb->sym = XK_space;
+      } else if (strcasecmp(tok, "tab") == 0) {
+        kb->sym = XK_Tab;
+      } else if (strlen(tok) == 1) {
+        char c = tok[0];
+        if (c >= 'A' && c <= 'Z')
+          kb->sym = (KeySym)(XK_a + (c - 'A'));
+        else if (c >= 'a' && c <= 'z')
+          kb->sym = (KeySym)(XK_a + (c - 'a'));
+        else
+          kb->sym = (KeySym)(unsigned char)c;
+      } else {
+        KeySym ks = XStringToKeysym(tok);
+        if (ks == NoSymbol) {
+          char cap[64];
+          snprintf(cap, sizeof(cap), "%s", tok);
+          cap[0] = (char)toupper((unsigned char)cap[0]);
+          for (int i = 1; cap[i]; i++)
+            cap[i] = (char)tolower((unsigned char)cap[i]);
+          ks = XStringToKeysym(cap);
+        }
+        if (ks == NoSymbol)
+          return -1;
+        if (ks >= XK_A && ks <= XK_Z)
+          ks = ks - XK_A + XK_a;
+        kb->sym = ks;
+      }
+    }
+    tok = next;
+  }
+  return (kb->sym != NoSymbol) ? 0 : -1;
+}
+
+static void load_config(void) {
+  init_default_bindings();
+
+  char path[PATH_MAX];
+  const char *rc = getenv("TERMINATOR_RC");
+  const char *home = getenv("HOME");
+  if (rc && *rc) {
+    snprintf(path, sizeof(path), "%s", rc);
+  } else if (home && *home) {
+    snprintf(path, sizeof(path), "%s/.terminatorrc", home);
+  } else {
+    return;
+  }
+
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return;
+
+  char *line = NULL;
+  size_t cap = 0;
+  ssize_t n;
+  int line_no = 0;
+  while ((n = getline(&line, &cap, f)) >= 0) {
+    line_no++;
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+      line[--n] = '\0';
+    char *p = line;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    if (!*p || *p == '#')
+      continue;
+
+    char cmd[64], act_str[64], key_str[64];
+    cmd[0] = act_str[0] = key_str[0] = '\0';
+    int items = sscanf(p, "%63s %63s %63s", cmd, act_str, key_str);
+    if (items < 3 || strcmp(cmd, "bind") != 0) {
+      fprintf(stderr, "terminator: %s:%d: bad syntax '%s', keeping default\n",
+              path, line_no, p);
+      continue;
+    }
+
+    ActionId act = parse_action_name(act_str);
+    if (act == ACT_NONE) {
+      fprintf(stderr,
+              "terminator: %s:%d: unknown action '%s', keeping default\n", path,
+              line_no, act_str);
+      continue;
+    }
+
+    KeyBinding kb;
+    if (parse_key_combo(key_str, &kb) != 0) {
+      fprintf(stderr, "terminator: %s:%d: bad key '%s', keeping default\n",
+              path, line_no, key_str);
+      continue;
+    }
+
+    bindings[act] = kb;
+  }
+  free(line);
+  fclose(f);
 }
 
 static void redraw(int win_w, int win_h) {
@@ -1867,11 +2102,15 @@ static void redraw(int win_w, int win_h) {
 
   XSetForeground(dpy, gc, col_text);
   XDrawString(dpy, win, gc, px, draw_y, cur->input, cur->input_len);
-  int cursor_x = px + cur->input_len * char_width;
+  int cursor_x = px + cur->input_pos * char_width;
 
   XSetForeground(dpy, gc, col_cursor);
   XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
                  char_height);
+  if (cur->input_pos < cur->input_len) {
+    XSetForeground(dpy, gc, col_bg);
+    XDrawString(dpy, win, gc, cursor_x, draw_y, &cur->input[cur->input_pos], 1);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -1892,6 +2131,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  load_config();
 
   /* Headless mode: run only the shell engine on stdin/stdout (for testing) */
   if (headless) {
@@ -2059,87 +2299,245 @@ int main(int argc, char **argv) {
         char kbuf[32];
         int len = XLookupString(&ev.xkey, kbuf, sizeof(kbuf) - 1, &ks, NULL);
         Tab *cur = &tabs[active_tab];
+        unsigned int mod = ev.xkey.state & (ControlMask | ShiftMask | Mod1Mask);
 
-        if ((ev.xkey.state & ControlMask) && (ks == XK_t || ks == XK_T)) {
-          create_tab();
-          redraw(win_w, win_h);
-        } else if ((ev.xkey.state & ControlMask) &&
-                   (ks == XK_c || ks == XK_C)) {
-          if (!signal_tab_job(active_tab, SIGINT)) {
-            tab_append_text(cur, "^C\n", 3);
-            cur->input_len = 0;
-            cur->input[0] = '\0';
-            cur->pending_len = 0;
-            cur->pending[0] = '\0';
-            cur->hist_pos = 0;
-            write_all(cur->in_fd, "\003", 1);
-            redraw(win_w, win_h);
-          }
-        } else if ((ev.xkey.state & ControlMask) &&
-                   (ks == XK_z || ks == XK_Z)) {
-          signal_tab_job(active_tab, SIGTSTP);
-        } else if (ks == XK_Up && cur->pending_len == 0) {
-          char h[MAX_HIST_LEN];
-          if (history_get_back(cur->hist_pos + 1, h, sizeof(h))) {
-            if (cur->hist_pos == 0)
-              memcpy(cur->saved_input, cur->input, sizeof(cur->saved_input));
-            cur->hist_pos++;
-            snprintf(cur->input, sizeof(cur->input), "%s", h);
-            cur->input_len = (int)strlen(cur->input);
-            redraw(win_w, win_h);
-          }
-        } else if (ks == XK_Down && cur->pending_len == 0 &&
-                   cur->hist_pos > 0) {
-          char h[MAX_HIST_LEN];
-          cur->hist_pos--;
-          if (cur->hist_pos == 0) {
-            memcpy(cur->input, cur->saved_input, sizeof(cur->input));
-          } else if (history_get_back(cur->hist_pos, h, sizeof(h))) {
-            snprintf(cur->input, sizeof(cur->input), "%s", h);
-          }
-          cur->input_len = (int)strlen(cur->input);
-          redraw(win_w, win_h);
-        } else if (ks == XK_BackSpace) {
-          if (cur->input_len > 0) {
-            cur->input[--cur->input_len] = '\0';
-            redraw(win_w, win_h);
-          }
-        } else if (ks == XK_Return) {
-          char echo_line[1200];
-          snprintf(echo_line, sizeof(echo_line), "%s%s\n",
-                   cur->pending_len > 0 ? CONT_PROMPT : "user@terminator> ",
-                   cur->input);
-          tab_append_text(cur, echo_line, strlen(echo_line));
-          write(cur->in_fd, cur->input, cur->input_len);
-          write(cur->in_fd, "\n", 1);
+        KeySym norm_ks = ks;
+        if (norm_ks >= XK_A && norm_ks <= XK_Z)
+          norm_ks = norm_ks - XK_A + XK_a;
 
-          if (!(cur->input_len == 0 && cur->pending_len == 0)) {
-            if (cur->pending_len + cur->input_len + 2 > MAX_CMD_LEN) {
-              cur->pending_len = 0;
-            } else {
-              if (cur->pending_len > 0)
-                cur->pending[cur->pending_len++] = '\n';
-              memcpy(cur->pending + cur->pending_len, cur->input,
-                     cur->input_len + 1);
-              cur->pending_len += cur->input_len;
-              if (input_status(cur->pending) == INPUT_COMPLETE)
-                cur->pending_len = 0;
-            }
-            cur->pending[cur->pending_len] = '\0';
-          }
-          cur->input_len = 0;
-          cur->input[0] = '\0';
-          cur->hist_pos = 0;
-          redraw(win_w, win_h);
-        } else if (len > 0 && (unsigned char)kbuf[0] >= 32 &&
-                   (unsigned char)kbuf[0] <= 126 &&
-                   !(ev.xkey.state & (ControlMask | Mod1Mask))) {
-          if (cur->input_len < (int)sizeof(cur->input) - 2) {
-            cur->input[cur->input_len++] = kbuf[0];
-            cur->input[cur->input_len] = '\0';
-            redraw(win_w, win_h);
+        ActionId action = ACT_NONE;
+        for (int a = 1; a < ACT_COUNT; a++) {
+          if (bindings[a].mod == mod && bindings[a].sym == norm_ks) {
+            action = (ActionId)a;
+            break;
           }
         }
+
+        switch (action) {
+          case ACT_NEW_TAB:
+            create_tab();
+            redraw(win_w, win_h);
+            break;
+          case ACT_INTERRUPT: {
+            /* signal the foreground job, else make the shell drop the line */
+            int job_signalled = signal_tab_job(active_tab, SIGINT);
+            tab_append_text(cur, "^C\n", 3);
+            if (!job_signalled) {
+              cur->input_len = 0;
+              cur->input_pos = 0;
+              cur->input[0] = '\0';
+              cur->pending_len = 0;
+              cur->pending[0] = '\0';
+              cur->hist_pos = 0;
+              write_all(cur->in_fd, "\003", 1);
+            }
+            redraw(win_w, win_h);
+            break;
+          }
+          case ACT_SUSPEND: /* stop the foreground job */
+            if (signal_tab_job(active_tab, SIGTSTP)) {
+              tab_append_text(cur, "^Z\n", 3);
+              redraw(win_w, win_h);
+            }
+            break;
+          case ACT_MOVE_LEFT:
+            if (cur->input_pos > 0) {
+              cur->input_pos--;
+              redraw(win_w, win_h);
+            }
+            break;
+          case ACT_MOVE_RIGHT:
+            if (cur->input_pos < cur->input_len) {
+              cur->input_pos++;
+              redraw(win_w, win_h);
+            }
+            break;
+          case ACT_START_OF_LINE:
+            cur->input_pos = 0;
+            redraw(win_w, win_h);
+            break;
+          case ACT_END_OF_LINE:
+            cur->input_pos = cur->input_len;
+            redraw(win_w, win_h);
+            break;
+          case ACT_HIST_PREV: /* history is shared by every tab */
+            if (cur->pending_len == 0) {
+              char h[MAX_HIST_LEN];
+              if (history_get_back(cur->hist_pos + 1, h, sizeof(h))) {
+                if (cur->hist_pos == 0)
+                  memcpy(cur->saved_input, cur->input,
+                         sizeof(cur->saved_input));
+                cur->hist_pos++;
+                snprintf(cur->input, sizeof(cur->input), "%s", h);
+                cur->input_len = (int)strlen(cur->input);
+                cur->input_pos = cur->input_len;
+                redraw(win_w, win_h);
+              }
+            }
+            break;
+          case ACT_HIST_NEXT:
+            if (cur->pending_len == 0 && cur->hist_pos > 0) {
+              char h[MAX_HIST_LEN];
+              cur->hist_pos--;
+              if (cur->hist_pos == 0) {
+                memcpy(cur->input, cur->saved_input, sizeof(cur->input));
+              } else if (history_get_back(cur->hist_pos, h, sizeof(h))) {
+                snprintf(cur->input, sizeof(cur->input), "%s", h);
+              }
+              cur->input_len = (int)strlen(cur->input);
+              cur->input_pos = cur->input_len;
+              redraw(win_w, win_h);
+            }
+            break;
+          case ACT_DEL_TO_START:
+            if (cur->input_pos > 0) {
+              memmove(cur->input, cur->input + cur->input_pos,
+                      cur->input_len - cur->input_pos + 1);
+              cur->input_len -= cur->input_pos;
+              cur->input_pos = 0;
+              redraw(win_w, win_h);
+            }
+            break;
+          case ACT_DEL_TO_END:
+            if (cur->input_pos < cur->input_len) {
+              cur->input[cur->input_pos] = '\0';
+              cur->input_len = cur->input_pos;
+              redraw(win_w, win_h);
+            }
+            break;
+          case ACT_DEL_WORD:
+            if (cur->input_pos > 0) {
+              int p = cur->input_pos;
+              while (p > 0 && isspace((unsigned char)cur->input[p - 1]))
+                p--;
+              while (p > 0 && !isspace((unsigned char)cur->input[p - 1]))
+                p--;
+              memmove(cur->input + p, cur->input + cur->input_pos,
+                      cur->input_len - cur->input_pos + 1);
+              cur->input_len -= (cur->input_pos - p);
+              cur->input_pos = p;
+              redraw(win_w, win_h);
+            }
+            break;
+          case ACT_CLEAR_SCREEN:
+            cur->line_count = 0;
+            cur->lines[0][0] = '\0';
+            redraw(win_w, win_h);
+            break;
+          case ACT_CLOSE_TAB:
+            if (cur->input_len == 0 && cur->pending_len == 0) {
+              if (cur->out_fd < 0) {
+                close_tab(active_tab);
+                if (tab_count == 0) {
+                  running = 0;
+                  break;
+                }
+                redraw(win_w, win_h);
+              } else {
+                cur->closing = 1;
+                if (cur->in_fd >= 0) {
+                  close(cur->in_fd);
+                  cur->in_fd = -1;
+                }
+              }
+            } else if (cur->input_pos < cur->input_len) {
+              memmove(cur->input + cur->input_pos,
+                      cur->input + cur->input_pos + 1,
+                      cur->input_len - cur->input_pos);
+              cur->input_len--;
+              redraw(win_w, win_h);
+            }
+            break;
+          case ACT_COPY:
+            if (shared_state) {
+              shared_lock();
+              if (cur->input_len > 0) {
+                snprintf(shared_state->clipboard,
+                         sizeof(shared_state->clipboard), "%s", cur->input);
+              } else if (cur->line_count > 0) {
+                snprintf(shared_state->clipboard,
+                         sizeof(shared_state->clipboard), "%s",
+                         cur->lines[cur->line_count - 1]);
+              }
+              shared_unlock();
+            }
+            break;
+          case ACT_PASTE:
+            if (shared_state) {
+              shared_lock();
+              char clip[4096];
+              snprintf(clip, sizeof(clip), "%s", shared_state->clipboard);
+              shared_unlock();
+              size_t clen = strlen(clip);
+              if (clen > 0 &&
+                  cur->input_len + (int)clen < (int)sizeof(cur->input) - 2) {
+                memmove(cur->input + cur->input_pos + clen,
+                        cur->input + cur->input_pos,
+                        cur->input_len - cur->input_pos + 1);
+                memcpy(cur->input + cur->input_pos, clip, clen);
+                cur->input_len += (int)clen;
+                cur->input_pos += (int)clen;
+                redraw(win_w, win_h);
+              }
+            }
+            break;
+          case ACT_NONE:
+          default:
+            if (ks == XK_BackSpace) {
+              if (cur->input_pos > 0) {
+                memmove(cur->input + cur->input_pos - 1,
+                        cur->input + cur->input_pos,
+                        cur->input_len - cur->input_pos + 1);
+                cur->input_len--;
+                cur->input_pos--;
+                redraw(win_w, win_h);
+              }
+            } else if (ks == XK_Return) {
+              char echo_line[1200];
+              snprintf(echo_line, sizeof(echo_line), "%s%s\n",
+                       cur->pending_len > 0 ? CONT_PROMPT : "user@terminator> ",
+                       cur->input);
+              tab_append_text(cur, echo_line, strlen(echo_line));
+
+              write(cur->in_fd, cur->input, cur->input_len);
+              write(cur->in_fd, "\n", 1);
+
+              /* track the command like the shell does, to pick the prompt */
+              if (!(cur->input_len == 0 && cur->pending_len == 0)) {
+                if (cur->pending_len + cur->input_len + 2 > MAX_CMD_LEN) {
+                  cur->pending_len = 0;
+                } else {
+                  if (cur->pending_len > 0)
+                    cur->pending[cur->pending_len++] = '\n';
+                  memcpy(cur->pending + cur->pending_len, cur->input,
+                         cur->input_len + 1);
+                  cur->pending_len += cur->input_len;
+                  if (input_status(cur->pending) == INPUT_COMPLETE)
+                    cur->pending_len = 0;
+                }
+                cur->pending[cur->pending_len] = '\0';
+              }
+
+              cur->input_len = 0;
+              cur->input_pos = 0;
+              cur->input[0] = '\0';
+              cur->hist_pos = 0;
+              redraw(win_w, win_h);
+            } else if (len > 0 && (unsigned char)kbuf[0] >= 32 &&
+                       (unsigned char)kbuf[0] <= 126 &&
+                       !(mod & (ControlMask | Mod1Mask))) {
+              if (cur->input_len < (int)sizeof(cur->input) - 2) {
+                memmove(cur->input + cur->input_pos + 1,
+                        cur->input + cur->input_pos,
+                        cur->input_len - cur->input_pos + 1);
+                cur->input[cur->input_pos++] = kbuf[0];
+                cur->input_len++;
+                cur->input[cur->input_len] = '\0';
+                redraw(win_w, win_h);
+              }
+            }
+            break;
+          }
       }
     }
   }
