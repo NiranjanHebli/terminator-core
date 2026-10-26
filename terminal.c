@@ -44,6 +44,9 @@ typedef struct {
   int hist_pos; /* 0 = editing a fresh line, k = k-th most recent command */
   char saved_input[1024]; /* the half-typed line while browsing history */
   int input_pos;          /* cursor position inside input */
+  int searching;          /* Ctrl+R "Enter search term:" mode */
+  char search[128];
+  int search_len;
   int slot;           /* index into the shared per-tab state (fg_pgid) */
   int closing;        /* Ctrl+D sent EOF: remove the tab once it has exited */
   int remove_pending; /* shell output hit EOF after closing */
@@ -240,6 +243,29 @@ static void shared_unlock(void) {
 }
 
 /* History file: loaded at startup, appended to on every command */
+static char hist_path[PATH_MAX];
+
+static void history_init_path(void) {
+  const char *e = getenv("TERMINATOR_HISTFILE");
+  const char *home = getenv("HOME");
+  hist_path[0] = '\0';
+  if (e && *e)
+    snprintf(hist_path, sizeof(hist_path), "%s", e);
+  else if (home && *home)
+    snprintf(hist_path, sizeof(hist_path), "%s/.terminator_history", home);
+}
+
+/* Store cmd in the ring (newlines become spaces); caller holds the lock */
+static const char *history_store(const char *cmd) {
+  char *slot = shared_state->history[shared_state->total % MAX_HISTORY];
+  size_t n = 0;
+  for (; cmd[n] && n < MAX_HIST_LEN - 1; n++)
+    slot[n] = (cmd[n] == '\n' || cmd[n] == '\r') ? ' ' : cmd[n];
+  slot[n] = '\0';
+  shared_state->total++;
+  return slot;
+}
+
 static void history_add(const char *cmd) {
   const char *p = cmd;
   while (*p == ' ' || *p == '\t' || *p == '\n')
@@ -247,13 +273,66 @@ static void history_add(const char *cmd) {
   if (!*p || !shared_state)
     return;
   shared_lock();
-  char *slot = shared_state->history[shared_state->total % MAX_HISTORY];
-  size_t n = 0;
-  for (; cmd[n] && n < MAX_HIST_LEN - 1; n++)
-    slot[n] = (cmd[n] == '\n') ? ' ' : cmd[n];
-  slot[n] = '\0';
-  shared_state->total++;
+  const char *stored = history_store(cmd);
+  if (hist_path[0]) {
+    /* one O_APPEND write under the lock, so lines never interleave */
+    int fd = open(hist_path, O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if (fd >= 0) {
+      char buf[MAX_HIST_LEN + 2];
+      int l = snprintf(buf, sizeof(buf), "%s\n", stored);
+      write_all(fd, buf, (size_t)l);
+      close(fd);
+    }
+  }
   shared_unlock();
+}
+
+/* Rewrite the file with only the ring's contents (the last MAX_HISTORY). */
+static void history_rewrite(void) {
+  char tmp[PATH_MAX + 8];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", hist_path);
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return;
+  FILE *f = fdopen(fd, "w");
+  if (!f) {
+    close(fd);
+    return;
+  }
+  long total = shared_state->total;
+  long first = total > MAX_HISTORY ? total - MAX_HISTORY : 0;
+  for (long n = first; n < total; n++)
+    fprintf(f, "%s\n", shared_state->history[n % MAX_HISTORY]);
+  if (fclose(f) != 0 || rename(tmp, hist_path) != 0)
+    remove(tmp);
+}
+
+/* Load the history file into the ring once at startup, trimming extras */
+static void history_load(void) {
+  if (!hist_path[0] || !shared_state)
+    return;
+  FILE *f = fopen(hist_path, "r");
+  if (!f)
+    return;
+  char *line = NULL;
+  size_t cap = 0;
+  ssize_t n;
+  long lines = 0;
+  while ((n = getline(&line, &cap, f)) >= 0) {
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+      line[--n] = '\0';
+    const char *p = line;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    if (!*p)
+      continue;
+    history_store(line);
+    lines++;
+  }
+  free(line);
+  fclose(f);
+  if (lines > MAX_HISTORY)
+    history_rewrite();
 }
 
 static long history_total(void) {
@@ -297,6 +376,112 @@ static void print_history(int fd) {
     int l = snprintf(line, sizeof(line), "%5ld  %s\n", n + 1, entry);
     write_all(fd, line, (size_t)l);
   }
+}
+
+/* History search: exact match, else longest common substring (> 2) */
+#define SEARCH_MAX 128
+#define SEARCH_RESULTS_MAX 1000
+#define NO_MATCH_MSG "No match for search term in history"
+
+static int longest_common_substring(const char *a, const char *b, size_t blen) {
+  int row[SEARCH_MAX + 1];
+  int best = 0;
+  memset(row, 0, sizeof(row));
+  for (const char *p = a; *p; p++) {
+    for (size_t j = blen; j >= 1; j--) {
+      row[j] = (*p == b[j - 1]) ? row[j - 1] + 1 : 0;
+      if (row[j] > best)
+        best = row[j];
+    }
+  }
+  return best;
+}
+
+static int is_search_cmd(const char *cmd) {
+  while (*cmd == ' ' || *cmd == '\t')
+    cmd++;
+  return (strncmp(cmd, "history -s", 10) == 0 ||
+          strncmp(cmd, "history search", 14) == 0);
+}
+
+/* Returns 0 = no match, 1 = exact, 2 = substring; results go to out */
+static int history_search(const char *term, char *out, size_t cap) {
+  char t[SEARCH_MAX + 1];
+  size_t tlen = strlen(term);
+  if (tlen > SEARCH_MAX)
+    tlen = SEARCH_MAX;
+  memcpy(t, term, tlen);
+  t[tlen] = '\0';
+  out[0] = '\0';
+  if (tlen == 0 || !shared_state)
+    return 0;
+
+  int kind = 0;
+  shared_lock();
+  long total = shared_state->total;
+  long first = total > MAX_HISTORY ? total - MAX_HISTORY : 0;
+
+  /* 1. Exact match: find the most recent one */
+  for (long n = total - 1; n >= first; n--) {
+    const char *e = shared_state->history[n % MAX_HISTORY];
+    if (is_search_cmd(e))
+      continue;
+    if (strcmp(e, t) == 0) {
+      snprintf(out, cap, "%s\n", e);
+      kind = 1;
+      break;
+    }
+  }
+
+  /* 2. Else: longest common substring if longer than 2 characters */
+  if (!kind && total > first) {
+    unsigned short *lens = malloc((size_t)(total - first) * sizeof(*lens));
+    if (lens) {
+      int best = 0;
+      for (long n = first; n < total; n++) {
+        const char *e = shared_state->history[n % MAX_HISTORY];
+        int l = is_search_cmd(e) ? 0 : longest_common_substring(e, t, tlen);
+        lens[n - first] = (unsigned short)l;
+        if (l > best)
+          best = l;
+      }
+      if (best > 2) {
+        const char *found[SEARCH_RESULTS_MAX];
+        int nf = 0;
+        for (long n = total - 1; n >= first && nf < SEARCH_RESULTS_MAX; n--) {
+          if (lens[n - first] != best)
+            continue;
+          const char *e = shared_state->history[n % MAX_HISTORY];
+          int dup = 0;
+          for (int k = 0; k < nf && !dup; k++)
+            dup = (strcmp(found[k], e) == 0);
+          if (!dup)
+            found[nf++] = e;
+        }
+        /* Output chronological (oldest to newest) */
+        size_t used = 0;
+        int m = 0;
+        while (m < nf && used + strlen(found[m]) + 1 < cap) {
+          used += strlen(found[m]) + 1;
+          m++;
+        }
+        size_t o = 0;
+        for (int k = m - 1; k >= 0; k--) {
+          size_t l = strlen(found[k]);
+          if (o + l + 1 < cap) {
+            memcpy(out + o, found[k], l);
+            o += l;
+            out[o++] = '\n';
+          }
+        }
+        out[o] = '\0';
+        kind = 2;
+      }
+      free(lens);
+    }
+  }
+  shared_unlock();
+  return kind;
 }
 
 /* ---- per-tab working directory ---- */
@@ -1258,7 +1443,19 @@ static int execute_line(const char *line) {
       }
       /* history runs in the child so it can be piped and redirected */
       if (strcmp(stage_argv[s][0], "history") == 0) {
-        print_history(STDOUT_FILENO);
+        if (stage_argc[s] >= 3 && (strcmp(stage_argv[s][1], "-s") == 0 ||
+                                   strcmp(stage_argv[s][1], "search") == 0)) {
+          char res[MAX_HIST_LEN * 32];
+          int kind = history_search(stage_argv[s][2], res, sizeof(res));
+          if (kind > 0) {
+            write_all(STDOUT_FILENO, res, strlen(res));
+          } else {
+            write_all(STDOUT_FILENO, NO_MATCH_MSG "\n",
+                      strlen(NO_MATCH_MSG) + 1);
+          }
+        } else {
+          print_history(STDOUT_FILENO);
+        }
         _exit(0);
       }
       /* jobs, like history, runs in the child so it can be piped */
@@ -1748,6 +1945,9 @@ static void create_tab(void) {
   t->input[0] = '\0';
   t->input_len = 0;
   t->input_pos = 0;
+  t->searching = 0;
+  t->search[0] = '\0';
+  t->search_len = 0;
   t->slot = slot;
   t->closing = 0;
   t->remove_pending = 0;
@@ -1813,6 +2013,7 @@ typedef enum {
   ACT_CLOSE_TAB,
   ACT_COPY,
   ACT_PASTE,
+  ACT_SEARCH_HIST,
   ACT_NEW_TAB,
   ACT_INTERRUPT,
   ACT_SUSPEND,
@@ -1840,6 +2041,7 @@ static void init_default_bindings(void) {
   bindings[ACT_CLOSE_TAB] = (KeyBinding){ControlMask, XK_d};
   bindings[ACT_COPY] = (KeyBinding){ControlMask | ShiftMask, XK_c};
   bindings[ACT_PASTE] = (KeyBinding){ControlMask | ShiftMask, XK_v};
+  bindings[ACT_SEARCH_HIST] = (KeyBinding){ControlMask, XK_r};
   bindings[ACT_NEW_TAB] = (KeyBinding){ControlMask, XK_t};
   bindings[ACT_INTERRUPT] = (KeyBinding){ControlMask, XK_c};
   bindings[ACT_SUSPEND] = (KeyBinding){ControlMask, XK_z};
@@ -1887,6 +2089,10 @@ static ActionId parse_action_name(const char *name) {
     return ACT_COPY;
   if (strcasecmp(name, "paste") == 0)
     return ACT_PASTE;
+  if (strcasecmp(name, "history-search") == 0 ||
+      strcasecmp(name, "search-history") == 0 ||
+      strcasecmp(name, "reverse-search") == 0)
+    return ACT_SEARCH_HIST;
   if (strcasecmp(name, "new-tab") == 0)
     return ACT_NEW_TAB;
   if (strcasecmp(name, "interrupt") == 0)
@@ -2089,27 +2295,43 @@ static void redraw(int win_w, int win_h) {
     draw_y += char_height;
   }
 
-  /* Continuation lines of a multiline command only show the "> " prompt */
-  const char *prompt_user = cur->pending_len > 0 ? "" : "user@terminator";
-  const char *prompt_arrow = cur->pending_len > 0 ? CONT_PROMPT : "> ";
-  XSetForeground(dpy, gc, col_prompt_user);
-  XDrawString(dpy, win, gc, 16, draw_y, prompt_user, strlen(prompt_user));
-  int px = 16 + strlen(prompt_user) * char_width;
+  if (cur->searching) {
+    const char *srch_prompt = "Enter search term: ";
+    XSetForeground(dpy, gc, col_prompt_arrow);
+    XDrawString(dpy, win, gc, 16, draw_y, srch_prompt, strlen(srch_prompt));
+    int spx = 16 + strlen(srch_prompt) * char_width;
 
-  XSetForeground(dpy, gc, col_prompt_arrow);
-  XDrawString(dpy, win, gc, px, draw_y, prompt_arrow, strlen(prompt_arrow));
-  px += strlen(prompt_arrow) * char_width;
+    XSetForeground(dpy, gc, col_text);
+    XDrawString(dpy, win, gc, spx, draw_y, cur->search, cur->search_len);
+    int cursor_x = spx + cur->search_len * char_width;
 
-  XSetForeground(dpy, gc, col_text);
-  XDrawString(dpy, win, gc, px, draw_y, cur->input, cur->input_len);
-  int cursor_x = px + cur->input_pos * char_width;
+    XSetForeground(dpy, gc, col_cursor);
+    XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
+                   char_height);
+  } else {
+    /* Continuation lines of a multiline command only show the "> " prompt */
+    const char *prompt_user = cur->pending_len > 0 ? "" : "user@terminator";
+    const char *prompt_arrow = cur->pending_len > 0 ? CONT_PROMPT : "> ";
+    XSetForeground(dpy, gc, col_prompt_user);
+    XDrawString(dpy, win, gc, 16, draw_y, prompt_user, strlen(prompt_user));
+    int px = 16 + strlen(prompt_user) * char_width;
 
-  XSetForeground(dpy, gc, col_cursor);
-  XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
-                 char_height);
-  if (cur->input_pos < cur->input_len) {
-    XSetForeground(dpy, gc, col_bg);
-    XDrawString(dpy, win, gc, cursor_x, draw_y, &cur->input[cur->input_pos], 1);
+    XSetForeground(dpy, gc, col_prompt_arrow);
+    XDrawString(dpy, win, gc, px, draw_y, prompt_arrow, strlen(prompt_arrow));
+    px += strlen(prompt_arrow) * char_width;
+
+    XSetForeground(dpy, gc, col_text);
+    XDrawString(dpy, win, gc, px, draw_y, cur->input, cur->input_len);
+    int cursor_x = px + cur->input_pos * char_width;
+
+    XSetForeground(dpy, gc, col_cursor);
+    XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
+                   char_height);
+    if (cur->input_pos < cur->input_len) {
+      XSetForeground(dpy, gc, col_bg);
+      XDrawString(dpy, win, gc, cursor_x, draw_y, &cur->input[cur->input_pos],
+                  1);
+    }
   }
 }
 
@@ -2131,6 +2353,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  history_init_path();
+  history_load();
   load_config();
 
   /* Headless mode: run only the shell engine on stdin/stdout (for testing) */
@@ -2313,7 +2537,55 @@ int main(int argc, char **argv) {
           }
         }
 
-        switch (action) {
+        if (cur->searching) {
+          if (action == ACT_INTERRUPT || ks == XK_Escape) {
+            cur->searching = 0;
+            cur->search_len = 0;
+            cur->search[0] = '\0';
+            tab_append_text(cur, "^C\n", 3);
+            redraw(win_w, win_h);
+          } else if (ks == XK_BackSpace) {
+            if (cur->search_len > 0) {
+              cur->search[--cur->search_len] = '\0';
+              redraw(win_w, win_h);
+            }
+          } else if (ks == XK_Return) {
+            cur->searching = 0;
+            char echo_srch[256];
+            snprintf(echo_srch, sizeof(echo_srch), "Enter search term: %s\n",
+                     cur->search);
+            tab_append_text(cur, echo_srch, strlen(echo_srch));
+
+            char res[MAX_HIST_LEN * 32];
+            int kind = history_search(cur->search, res, sizeof(res));
+            if (kind == 1) {
+              tab_append_text(cur, res, strlen(res));
+              size_t rlen = strlen(res);
+              while (rlen > 0 &&
+                     (res[rlen - 1] == '\n' || res[rlen - 1] == '\r'))
+                res[--rlen] = '\0';
+              snprintf(cur->input, sizeof(cur->input), "%s", res);
+              cur->input_len = (int)strlen(cur->input);
+              cur->input_pos = cur->input_len;
+            } else if (kind == 2) {
+              tab_append_text(cur, res, strlen(res));
+            } else {
+              const char *nomatch = NO_MATCH_MSG "\n";
+              tab_append_text(cur, nomatch, strlen(nomatch));
+            }
+            cur->search_len = 0;
+            cur->search[0] = '\0';
+            redraw(win_w, win_h);
+          } else if (len > 0 && (unsigned char)kbuf[0] >= 32 &&
+                     (unsigned char)kbuf[0] <= 126) {
+            if (cur->search_len < (int)sizeof(cur->search) - 2) {
+              cur->search[cur->search_len++] = kbuf[0];
+              cur->search[cur->search_len] = '\0';
+              redraw(win_w, win_h);
+            }
+          }
+        } else {
+          switch (action) {
           case ACT_NEW_TAB:
             create_tab();
             redraw(win_w, win_h);
@@ -2481,6 +2753,12 @@ int main(int argc, char **argv) {
               }
             }
             break;
+          case ACT_SEARCH_HIST:
+            cur->searching = 1;
+            cur->search[0] = '\0';
+            cur->search_len = 0;
+            redraw(win_w, win_h);
+            break;
           case ACT_NONE:
           default:
             if (ks == XK_BackSpace) {
@@ -2538,6 +2816,7 @@ int main(int argc, char **argv) {
             }
             break;
           }
+        }
       }
     }
   }
