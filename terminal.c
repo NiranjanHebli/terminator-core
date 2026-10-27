@@ -50,6 +50,10 @@ typedef struct {
   int slot;           /* index into the shared per-tab state (fg_pgid) */
   int closing;        /* Ctrl+D sent EOF: remove the tab once it has exited */
   int remove_pending; /* shell output hit EOF after closing */
+  int completing;     /* 1 = waiting for user to press 1..9 to pick a file */
+  char comp_matches[64][256];
+  int comp_count;
+  int comp_replace_start;
   char cwd[PATH_MAX];
   char lines[MAX_LINES][MAX_LINE_LEN];
   int line_count;
@@ -1955,6 +1959,9 @@ static void create_tab(void) {
   t->pending_len = 0;
   t->hist_pos = 0;
   t->saved_input[0] = '\0';
+  t->completing = 0;
+  t->comp_count = 0;
+  t->comp_replace_start = 0;
   if (!getcwd(t->cwd, sizeof(t->cwd)))
     snprintf(t->cwd, sizeof(t->cwd), ".");
   t->line_count = 0;
@@ -2234,6 +2241,148 @@ static void load_config(void) {
   }
   free(line);
   fclose(f);
+}
+
+/* ---- Task 10: Tab filename auto-completion (Slide 31) ---- */
+static int cmp_str_ptr(const void *a, const void *b) {
+  return strcmp((const char *)a, (const char *)b);
+}
+
+static void replace_input_range(Tab *cur, int start, int end,
+                                const char *replacement) {
+  int rlen = (int)strlen(replacement);
+  int tail_len = cur->input_len - end;
+  if (start + rlen + tail_len >= (int)sizeof(cur->input) - 1)
+    return;
+  memmove(cur->input + start + rlen, cur->input + end, (size_t)tail_len + 1);
+  memcpy(cur->input + start, replacement, (size_t)rlen);
+  cur->input_len = start + rlen + tail_len;
+  cur->input_pos = start + rlen;
+}
+
+static void handle_tab_completion(Tab *cur) {
+  cur->completing = 0;
+  cur->comp_count = 0;
+
+  /* Find start of current filename word before cursor */
+  int wstart = cur->input_pos;
+  while (wstart > 0 && !isspace((unsigned char)cur->input[wstart - 1]) &&
+         cur->input[wstart - 1] != '|' && cur->input[wstart - 1] != '<' &&
+         cur->input[wstart - 1] != '>' && cur->input[wstart - 1] != '&') {
+    wstart--;
+  }
+
+  char token[512];
+  int tlen = cur->input_pos - wstart;
+  if (tlen < 0)
+    tlen = 0;
+  if (tlen >= (int)sizeof(token))
+    tlen = (int)sizeof(token) - 1;
+  memcpy(token, cur->input + wstart, (size_t)tlen);
+  token[tlen] = '\0';
+
+  /* Split token into optional directory part and filename prefix */
+  char dir_path[PATH_MAX * 2];
+  const char *prefix = token;
+  int replace_start = wstart;
+  char *last_slash = strrchr(token, '/');
+
+  if (last_slash) {
+    prefix = last_slash + 1;
+    replace_start = wstart + (int)(prefix - token);
+    size_t dlen = (size_t)(last_slash - token);
+    char sub[512];
+    if (dlen == 0) {
+      snprintf(dir_path, sizeof(dir_path), "/");
+    } else {
+      if (dlen >= sizeof(sub))
+        dlen = sizeof(sub) - 1;
+      memcpy(sub, token, dlen);
+      sub[dlen] = '\0';
+      if (sub[0] == '/')
+        snprintf(dir_path, sizeof(dir_path), "%s", sub);
+      else
+        snprintf(dir_path, sizeof(dir_path), "%s/%s",
+                 cur->cwd[0] ? cur->cwd : ".", sub);
+    }
+  } else {
+    snprintf(dir_path, sizeof(dir_path), "%s", cur->cwd[0] ? cur->cwd : ".");
+  }
+
+  DIR *d = opendir(dir_path);
+  if (!d)
+    return;
+
+  size_t plen = strlen(prefix);
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+      continue;
+    /* Skip hidden dot-files unless prefix starts with '.' */
+    if (de->d_name[0] == '.' && prefix[0] != '.')
+      continue;
+    if (strncmp(de->d_name, prefix, plen) == 0) {
+      if (cur->comp_count < 64) {
+        snprintf(cur->comp_matches[cur->comp_count],
+                 sizeof(cur->comp_matches[0]), "%s", de->d_name);
+        cur->comp_count++;
+      }
+    }
+  }
+  closedir(d);
+
+  if (cur->comp_count == 0) {
+    return; /* No match: do nothing (Slide 31) */
+  }
+
+  qsort(cur->comp_matches, (size_t)cur->comp_count,
+        sizeof(cur->comp_matches[0]), cmp_str_ptr);
+
+  if (cur->comp_count == 1) {
+    /* One match: complete it. The rest of the line stays as typed (Slide 31) */
+    replace_input_range(cur, replace_start, cur->input_pos,
+                        cur->comp_matches[0]);
+    return;
+  }
+
+  /* Several matches: extend to longest common prefix, then show numbered list
+   */
+  size_t lcp = strlen(cur->comp_matches[0]);
+  for (int i = 1; i < cur->comp_count; i++) {
+    size_t j = 0;
+    while (j < lcp && cur->comp_matches[0][j] == cur->comp_matches[i][j])
+      j++;
+    lcp = j;
+  }
+
+  char lcp_str[256];
+  if (lcp >= sizeof(lcp_str))
+    lcp = sizeof(lcp_str) - 1;
+  memcpy(lcp_str, cur->comp_matches[0], lcp);
+  lcp_str[lcp] = '\0';
+
+  replace_input_range(cur, replace_start, cur->input_pos, lcp_str);
+  cur->comp_replace_start = replace_start;
+  cur->completing = 1;
+
+  /* Echo current prompt + line and the numbered list to the terminal buffer */
+  char echo_line[1200];
+  snprintf(echo_line, sizeof(echo_line), "%s%s\n",
+           cur->pending_len > 0 ? CONT_PROMPT : "user@terminator> ",
+           cur->input);
+  tab_append_text(cur, echo_line, (int)strlen(echo_line));
+
+  char list_buf[2048];
+  size_t off = 0;
+  for (int i = 0; i < cur->comp_count; i++) {
+    int n = snprintf(list_buf + off, sizeof(list_buf) - off, "%s%d. %s",
+                     (i > 0) ? "  " : "", i + 1, cur->comp_matches[i]);
+    if (n > 0 && off + (size_t)n < sizeof(list_buf) - 2)
+      off += (size_t)n;
+  }
+  list_buf[off++] = '\n';
+  list_buf[off] = '\0';
+  tab_append_text(cur, list_buf, (int)off);
 }
 
 static void redraw(int win_w, int win_h) {
@@ -2585,6 +2734,22 @@ int main(int argc, char **argv) {
             }
           }
         } else {
+          if (cur->completing && action == ACT_NONE && len == 1 &&
+              kbuf[0] >= '1' && kbuf[0] <= '9' &&
+              !(mod & (ControlMask | Mod1Mask))) {
+            int pick = kbuf[0] - '1';
+            if (pick < cur->comp_count) {
+              cur->completing = 0;
+              replace_input_range(cur, cur->comp_replace_start, cur->input_pos,
+                                  cur->comp_matches[pick]);
+              redraw(win_w, win_h);
+              continue;
+            }
+          }
+          if (ks != XK_Shift_L && ks != XK_Shift_R && ks != XK_Control_L &&
+              ks != XK_Control_R && ks != XK_Alt_L && ks != XK_Alt_R) {
+            cur->completing = 0;
+          }
           switch (action) {
           case ACT_NEW_TAB:
             create_tab();
@@ -2761,7 +2926,10 @@ int main(int argc, char **argv) {
             break;
           case ACT_NONE:
           default:
-            if (ks == XK_BackSpace) {
+            if (ks == XK_Tab && !(mod & (ControlMask | Mod1Mask))) {
+              handle_tab_completion(cur);
+              redraw(win_w, win_h);
+            } else if (ks == XK_BackSpace) {
               if (cur->input_pos > 0) {
                 memmove(cur->input + cur->input_pos - 1,
                         cur->input + cur->input_pos,
