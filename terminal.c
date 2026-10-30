@@ -858,9 +858,118 @@ static int scan_unit(const char *s, size_t *i, int in_paren) {
   return in_paren ? NEED_PAREN : INPUT_COMPLETE;
 }
 
+/* ---- Task 11: Shell variables & script positional parameters ---- */
+#define MAX_VARS 128
+
+typedef struct {
+  char name[64];
+  char val[1024];
+} ShellVar;
+
+static _Thread_local ShellVar shell_vars[MAX_VARS];
+static _Thread_local int shell_var_count = 0;
+static _Thread_local int script_argc = 0;
+static _Thread_local char script_argv[16][1024]; /* $0 .. $9+ */
+
+static void set_shell_var(const char *name, const char *val) {
+  for (int i = 0; i < shell_var_count; i++) {
+    if (strcmp(shell_vars[i].name, name) == 0) {
+      snprintf(shell_vars[i].val, sizeof(shell_vars[i].val), "%s", val);
+      setenv(name, val, 1);
+      return;
+    }
+  }
+  if (shell_var_count < MAX_VARS) {
+    snprintf(shell_vars[shell_var_count].name,
+             sizeof(shell_vars[shell_var_count].name), "%s", name);
+    snprintf(shell_vars[shell_var_count].val,
+             sizeof(shell_vars[shell_var_count].val), "%s", val);
+    shell_var_count++;
+  }
+  setenv(name, val, 1);
+}
+
+static const char *get_shell_var(const char *name) {
+  for (int i = 0; i < shell_var_count; i++) {
+    if (strcmp(shell_vars[i].name, name) == 0)
+      return shell_vars[i].val;
+  }
+  return getenv(name);
+}
+
+enum { NEED_FI = 5 };
+
+/* Count unclosed 'if' blocks across lines/semicolons while respecting quotes */
+static int count_if_depth(const char *s) {
+  int depth = 0;
+  size_t i = 0;
+  int at_cmd_start = 1;
+  while (s[i]) {
+    while (s[i] == ' ' || s[i] == '\t')
+      i++;
+    if (!s[i])
+      break;
+    if (s[i] == '#') {
+      while (s[i] && s[i] != '\n')
+        i++;
+      continue;
+    }
+    if (s[i] == '\n' || s[i] == ';') {
+      at_cmd_start = 1;
+      i++;
+      continue;
+    }
+    size_t start = i;
+    while (s[i] && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != ';') {
+      if (s[i] == '\'') {
+        i++;
+        while (s[i] && s[i] != '\'')
+          i++;
+        if (s[i])
+          i++;
+      } else if (s[i] == '"') {
+        i++;
+        while (s[i] && s[i] != '"') {
+          if (s[i] == '\\' && s[i + 1])
+            i += 2;
+          else
+            i++;
+        }
+        if (s[i])
+          i++;
+      } else if (s[i] == '\\' && s[i + 1]) {
+        i += 2;
+      } else {
+        i++;
+      }
+    }
+    size_t len = i - start;
+    if (at_cmd_start) {
+      if (len == 2 && strncmp(s + start, "if", 2) == 0)
+        depth++;
+      else if (len == 2 && strncmp(s + start, "fi", 2) == 0 && depth > 0)
+        depth--;
+      else if ((len == 4 && strncmp(s + start, "then", 4) == 0) ||
+               (len == 4 && strncmp(s + start, "else", 4) == 0) ||
+               (len == 4 && strncmp(s + start, "elif", 4) == 0)) {
+        at_cmd_start = 1;
+        continue;
+      }
+      at_cmd_start = 0;
+    }
+  }
+  return depth;
+}
+
+/* Is buf (physical lines joined with '\n') a complete command? */
 static int input_status(const char *buf) {
   size_t i = 0;
-  return scan_unit(buf, &i, 0);
+  int r = scan_unit(buf, &i, 0);
+  if (r != INPUT_COMPLETE)
+    return r;
+  if (count_if_depth(buf) > 0)
+    return NEED_FI;
+  return INPUT_COMPLETE;
 }
 
 /* ---- growable string used while building words ---- */
@@ -1016,6 +1125,15 @@ static void expand_dollar(const char *s, size_t *i, TokenList *tl, Str *w,
     snprintf(tmp, sizeof(tmp), "%d", last_status);
     emit_expansion(tl, w, in_word, tmp, quoted);
     *i += 2;
+  } else if (s[*i + 1] == '#') {
+    snprintf(tmp, sizeof(tmp), "%d", script_argc);
+    emit_expansion(tl, w, in_word, tmp, quoted);
+    *i += 2;
+  } else if (s[*i + 1] >= '0' && s[*i + 1] <= '9') {
+    int idx = s[*i + 1] - '0';
+    const char *val = (idx <= script_argc) ? script_argv[idx] : "";
+    emit_expansion(tl, w, in_word, val, quoted);
+    *i += 2;
   } else if (s[*i + 1] == '$') {
     snprintf(tmp, sizeof(tmp), "%d", (int)getpid());
     emit_expansion(tl, w, in_word, tmp, quoted);
@@ -1058,7 +1176,7 @@ static void expand_dollar(const char *s, size_t *i, TokenList *tl, Str *w,
         return;
       }
     }
-    const char *val = n ? getenv(name) : NULL;
+    const char *val = n ? get_shell_var(name) : NULL;
     emit_expansion(tl, w, in_word, val ? val : "", quoted);
     *i = j;
   } else {
@@ -1177,7 +1295,581 @@ static const char *op_name(int type) {
   }
 }
 
-static int execute_line(const char *line) {
+/* ---- Task 11: Built-in [ ... ] test, if/elif/else/fi & Script Interpreter
+ * ---- */
+static int eval_bracket_test(int argc, char **argv) {
+  if (strcmp(argv[0], "[") == 0) {
+    if (argc < 2 || strcmp(argv[argc - 1], "]") != 0) {
+      sh_err("terminator: [: missing ']'\n");
+      return 2;
+    }
+    argc--;
+  }
+  int pos = 1;
+  int neg = 0;
+  while (pos < argc && strcmp(argv[pos], "!") == 0) {
+    neg = !neg;
+    pos++;
+  }
+  int rem = argc - pos;
+  int res = 1;
+  char pbuf[PATH_MAX * 2];
+  struct stat st;
+
+  if (rem <= 0) {
+    res = 1;
+  } else if (rem == 1) {
+    res = (argv[pos][0] != '\0') ? 0 : 1;
+  } else if (rem == 2) {
+    const char *op = argv[pos];
+    const char *arg = argv[pos + 1];
+    if (strcmp(op, "-f") == 0)
+      res = (stat(resolve_path(arg, pbuf, sizeof(pbuf)), &st) == 0 &&
+             S_ISREG(st.st_mode))
+                ? 0
+                : 1;
+    else if (strcmp(op, "-d") == 0)
+      res = (stat(resolve_path(arg, pbuf, sizeof(pbuf)), &st) == 0 &&
+             S_ISDIR(st.st_mode))
+                ? 0
+                : 1;
+    else if (strcmp(op, "-e") == 0)
+      res = (stat(resolve_path(arg, pbuf, sizeof(pbuf)), &st) == 0) ? 0 : 1;
+    else if (strcmp(op, "-r") == 0)
+      res = (access(resolve_path(arg, pbuf, sizeof(pbuf)), R_OK) == 0) ? 0 : 1;
+    else if (strcmp(op, "-w") == 0)
+      res = (access(resolve_path(arg, pbuf, sizeof(pbuf)), W_OK) == 0) ? 0 : 1;
+    else if (strcmp(op, "-x") == 0)
+      res = (access(resolve_path(arg, pbuf, sizeof(pbuf)), X_OK) == 0) ? 0 : 1;
+    else if (strcmp(op, "-s") == 0)
+      res = (stat(resolve_path(arg, pbuf, sizeof(pbuf)), &st) == 0 &&
+             st.st_size > 0)
+                ? 0
+                : 1;
+    else if (strcmp(op, "-z") == 0)
+      res = (strlen(arg) == 0) ? 0 : 1;
+    else if (strcmp(op, "-n") == 0)
+      res = (strlen(arg) > 0) ? 0 : 1;
+  } else if (rem >= 3) {
+    const char *a = argv[pos];
+    const char *op = argv[pos + 1];
+    const char *b = argv[pos + 2];
+    if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0)
+      res = (strcmp(a, b) == 0) ? 0 : 1;
+    else if (strcmp(op, "!=") == 0)
+      res = (strcmp(a, b) != 0) ? 0 : 1;
+    else if (strcmp(op, "-eq") == 0)
+      res = (atoll(a) == atoll(b)) ? 0 : 1;
+    else if (strcmp(op, "-ne") == 0)
+      res = (atoll(a) != atoll(b)) ? 0 : 1;
+    else if (strcmp(op, "-lt") == 0)
+      res = (atoll(a) < atoll(b)) ? 0 : 1;
+    else if (strcmp(op, "-le") == 0)
+      res = (atoll(a) <= atoll(b)) ? 0 : 1;
+    else if (strcmp(op, "-gt") == 0)
+      res = (atoll(a) > atoll(b)) ? 0 : 1;
+    else if (strcmp(op, "-ge") == 0)
+      res = (atoll(a) >= atoll(b)) ? 0 : 1;
+  }
+  if (neg)
+    res = (res == 0) ? 1 : 0;
+  return res;
+}
+
+/* Split script/command buffer into next logical statement (separated by
+ * unquoted \n or ;) */
+static size_t next_statement(const char *s, size_t pos, char **out_stmt) {
+  while (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == ';')
+    pos++;
+  if (!s[pos]) {
+    *out_stmt = NULL;
+    return pos;
+  }
+  size_t start = pos;
+  int if_depth = 0;
+  int at_start = 1;
+
+  while (s[pos]) {
+    while (s[pos] == ' ' || s[pos] == '\t')
+      pos++;
+    if (!s[pos])
+      break;
+    if (s[pos] == '#') {
+      while (s[pos] && s[pos] != '\n')
+        pos++;
+      continue;
+    }
+    if (s[pos] == '\n' || s[pos] == ';') {
+      if (if_depth == 0) {
+        size_t len = pos - start;
+        char *r = malloc(len + 1);
+        if (!r)
+          _exit(1);
+        memcpy(r, s + start, len);
+        r[len] = '\0';
+        *out_stmt = r;
+        return pos + 1;
+      }
+      at_start = 1;
+      pos++;
+      continue;
+    }
+    size_t wstart = pos;
+    while (s[pos] && s[pos] != ' ' && s[pos] != '\t' && s[pos] != '\n' &&
+           s[pos] != ';') {
+      if (s[pos] == '\'') {
+        pos++;
+        while (s[pos] && s[pos] != '\'')
+          pos++;
+        if (s[pos])
+          pos++;
+      } else if (s[pos] == '"') {
+        pos++;
+        while (s[pos] && s[pos] != '"') {
+          if (s[pos] == '\\' && s[pos + 1])
+            pos += 2;
+          else
+            pos++;
+        }
+        if (s[pos])
+          pos++;
+      } else if (s[pos] == '$' && s[pos + 1] == '(') {
+        pos += 2;
+        scan_unit(s, &pos, 1);
+      } else if (s[pos] == '\\' && s[pos + 1]) {
+        pos += 2;
+      } else {
+        pos++;
+      }
+    }
+    size_t wlen = pos - wstart;
+    if (at_start) {
+      if (wlen == 2 && strncmp(s + wstart, "if", 2) == 0)
+        if_depth++;
+      else if (wlen == 2 && strncmp(s + wstart, "fi", 2) == 0 && if_depth > 0)
+        if_depth--;
+      else if ((wlen == 4 && strncmp(s + wstart, "then", 4) == 0) ||
+               (wlen == 4 && strncmp(s + wstart, "else", 4) == 0) ||
+               (wlen == 4 && strncmp(s + wstart, "elif", 4) == 0)) {
+        at_start = 1;
+        continue;
+      }
+      at_start = 0;
+    }
+  }
+  size_t len = pos - start;
+  char *r = malloc(len + 1);
+  if (!r)
+    _exit(1);
+  memcpy(r, s + start, len);
+  r[len] = '\0';
+  *out_stmt = r;
+  return pos;
+}
+
+static int execute_script_text(const char *text);
+
+/* Evaluate an if / elif / else / fi block (supports arbitrary nesting) */
+static int execute_if_block(const char *stmt) {
+  const char *p = stmt;
+  while (*p == ' ' || *p == '\t' || *p == '\n')
+    p++;
+  if (strncmp(p, "if", 2) != 0 || !isspace((unsigned char)p[2]))
+    return 2;
+  p += 2;
+
+  /* Parse clauses: condition + body for if/elif, or body for else */
+  while (*p) {
+    /* Find matching 'then' at depth 0 */
+    size_t i = 0;
+    int depth = 0;
+    int at_start = 1;
+    size_t then_pos = (size_t)-1;
+    while (p[i]) {
+      while (p[i] == ' ' || p[i] == '\t')
+        i++;
+      if (!p[i])
+        break;
+      if (p[i] == '#') {
+        while (p[i] && p[i] != '\n')
+          i++;
+        continue;
+      }
+      if (p[i] == '\n' || p[i] == ';') {
+        at_start = 1;
+        i++;
+        continue;
+      }
+      size_t ws = i;
+      while (p[i] && p[i] != ' ' && p[i] != '\t' && p[i] != '\n' &&
+             p[i] != ';') {
+        if (p[i] == '\'') {
+          i++;
+          while (p[i] && p[i] != '\'')
+            i++;
+          if (p[i])
+            i++;
+        } else if (p[i] == '"') {
+          i++;
+          while (p[i] && p[i] != '"') {
+            if (p[i] == '\\' && p[i + 1])
+              i += 2;
+            else
+              i++;
+          }
+          if (p[i])
+            i++;
+        } else if (p[i] == '\\' && p[i + 1]) {
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      size_t wl = i - ws;
+      if (at_start) {
+        if (wl == 2 && strncmp(p + ws, "if", 2) == 0)
+          depth++;
+        else if (wl == 2 && strncmp(p + ws, "fi", 2) == 0 && depth > 0)
+          depth--;
+        else if (depth == 0 && wl == 4 && strncmp(p + ws, "then", 4) == 0) {
+          then_pos = ws;
+          break;
+        }
+        at_start = 0;
+      }
+    }
+    if (then_pos == (size_t)-1) {
+      sh_err("terminator: syntax error: expected 'then'\n");
+      last_status = 2;
+      return 2;
+    }
+
+    char *cond = malloc(then_pos + 1);
+    if (!cond)
+      _exit(1);
+    memcpy(cond, p, then_pos);
+    cond[then_pos] = '\0';
+
+    const char *body_start = p + then_pos + 4;
+    if (*body_start == ';')
+      body_start++;
+
+    /* Find matching elif, else, or fi at depth 0 */
+    i = 0;
+    depth = 0;
+    at_start = 1;
+    size_t branch_pos = (size_t)-1;
+    int branch_type = 0; /* 1 = elif, 2 = else, 3 = fi */
+    while (body_start[i]) {
+      while (body_start[i] == ' ' || body_start[i] == '\t')
+        i++;
+      if (!body_start[i])
+        break;
+      if (body_start[i] == '#') {
+        while (body_start[i] && body_start[i] != '\n')
+          i++;
+        continue;
+      }
+      if (body_start[i] == '\n' || body_start[i] == ';') {
+        at_start = 1;
+        i++;
+        continue;
+      }
+      size_t ws = i;
+      while (body_start[i] && body_start[i] != ' ' && body_start[i] != '\t' &&
+             body_start[i] != '\n' && body_start[i] != ';') {
+        if (body_start[i] == '\'') {
+          i++;
+          while (body_start[i] && body_start[i] != '\'')
+            i++;
+          if (body_start[i])
+            i++;
+        } else if (body_start[i] == '"') {
+          i++;
+          while (body_start[i] && body_start[i] != '"') {
+            if (body_start[i] == '\\' && body_start[i + 1])
+              i += 2;
+            else
+              i++;
+          }
+          if (body_start[i])
+            i++;
+        } else if (body_start[i] == '\\' && body_start[i + 1]) {
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      size_t wl = i - ws;
+      if (at_start) {
+        if (wl == 2 && strncmp(body_start + ws, "if", 2) == 0) {
+          depth++;
+        } else if (wl == 2 && strncmp(body_start + ws, "fi", 2) == 0) {
+          if (depth == 0) {
+            branch_pos = ws;
+            branch_type = 3;
+            break;
+          }
+          depth--;
+        } else if (depth == 0 && wl == 4 &&
+                   strncmp(body_start + ws, "elif", 4) == 0) {
+          branch_pos = ws;
+          branch_type = 1;
+          break;
+        } else if (depth == 0 && wl == 4 &&
+                   strncmp(body_start + ws, "else", 4) == 0) {
+          branch_pos = ws;
+          branch_type = 2;
+          break;
+        } else if (wl == 4 && (strncmp(body_start + ws, "then", 4) == 0 ||
+                               strncmp(body_start + ws, "else", 4) == 0 ||
+                               strncmp(body_start + ws, "elif", 4) == 0)) {
+          at_start = 1;
+          continue;
+        }
+        at_start = 0;
+      }
+    }
+
+    if (branch_pos == (size_t)-1) {
+      free(cond);
+      sh_err("terminator: syntax error: expected 'fi'\n");
+      last_status = 2;
+      return 2;
+    }
+
+    int cond_rc = execute_script_text(cond);
+    free(cond);
+
+    if (cond_rc == 0) {
+      char *body = malloc(branch_pos + 1);
+      if (!body)
+        _exit(1);
+      memcpy(body, body_start, branch_pos);
+      body[branch_pos] = '\0';
+      last_status = execute_script_text(body);
+      free(body);
+      return last_status;
+    }
+
+    if (branch_type == 3) {
+      /* Hit 'fi' without taking a branch: exit status is 0 per POSIX */
+      last_status = 0;
+      return 0;
+    } else if (branch_type == 1) {
+      /* elif: advance p past 'elif' and loop */
+      p = body_start + branch_pos + 4;
+    } else if (branch_type == 2) {
+      /* else: find matching 'fi' at depth 0 and run else body */
+      const char *else_start = body_start + branch_pos + 4;
+      if (*else_start == ';')
+        else_start++;
+      size_t ei = 0;
+      int edepth = 0;
+      int eat_start = 1;
+      size_t fi_pos = (size_t)-1;
+      while (else_start[ei]) {
+        while (else_start[ei] == ' ' || else_start[ei] == '\t')
+          ei++;
+        if (!else_start[ei])
+          break;
+        if (else_start[ei] == '#') {
+          while (else_start[ei] && else_start[ei] != '\n')
+            ei++;
+          continue;
+        }
+        if (else_start[ei] == '\n' || else_start[ei] == ';') {
+          eat_start = 1;
+          ei++;
+          continue;
+        }
+        size_t ws = ei;
+        while (else_start[ei] && else_start[ei] != ' ' &&
+               else_start[ei] != '\t' && else_start[ei] != '\n' &&
+               else_start[ei] != ';') {
+          if (else_start[ei] == '\'') {
+            ei++;
+            while (else_start[ei] && else_start[ei] != '\'')
+              ei++;
+            if (else_start[ei])
+              ei++;
+          } else if (else_start[ei] == '"') {
+            ei++;
+            while (else_start[ei] && else_start[ei] != '"') {
+              if (else_start[ei] == '\\' && else_start[ei + 1])
+                ei += 2;
+              else
+                ei++;
+            }
+            if (else_start[ei])
+              ei++;
+          } else if (else_start[ei] == '\\' && else_start[ei + 1]) {
+            ei += 2;
+          } else {
+            ei++;
+          }
+        }
+        size_t wl = ei - ws;
+        if (eat_start) {
+          if (wl == 2 && strncmp(else_start + ws, "if", 2) == 0) {
+            edepth++;
+          } else if (wl == 2 && strncmp(else_start + ws, "fi", 2) == 0) {
+            if (edepth == 0) {
+              fi_pos = ws;
+              break;
+            }
+            edepth--;
+          } else if (wl == 4 && (strncmp(else_start + ws, "then", 4) == 0 ||
+                                 strncmp(else_start + ws, "else", 4) == 0 ||
+                                 strncmp(else_start + ws, "elif", 4) == 0)) {
+            eat_start = 1;
+            continue;
+          }
+          eat_start = 0;
+        }
+      }
+      if (fi_pos == (size_t)-1) {
+        sh_err("terminator: syntax error: expected 'fi'\n");
+        last_status = 2;
+        return 2;
+      }
+      char *ebody = malloc(fi_pos + 1);
+      if (!ebody)
+        _exit(1);
+      memcpy(ebody, else_start, fi_pos);
+      ebody[fi_pos] = '\0';
+      last_status = execute_script_text(ebody);
+      free(ebody);
+      return last_status;
+    }
+  }
+  return last_status;
+}
+
+static int execute_single_line(const char *line);
+
+static int execute_script_text(const char *text) {
+  size_t pos = 0;
+  char *stmt = NULL;
+  while (!shell_exit_requested && (pos = next_statement(text, pos, &stmt)) &&
+         stmt != NULL) {
+    const char *p = stmt;
+    while (*p == ' ' || *p == '\t' || *p == '\n')
+      p++;
+    if (*p && *p != '#') {
+      if (strncmp(p, "if", 2) == 0 &&
+          (p[2] == ' ' || p[2] == '\t' || p[2] == '\n')) {
+        last_status = execute_if_block(p);
+      } else {
+        last_status = execute_single_line(p);
+      }
+    }
+    free(stmt);
+    stmt = NULL;
+  }
+  return last_status;
+}
+
+/* Read and interpret a script file directly in Terminator (not /bin/bash) */
+static int run_script_file(const char *path, int argc, char **argv,
+                           int is_sourced) {
+  char pbuf[PATH_MAX * 2];
+  const char *rpath = resolve_path(path, pbuf, sizeof(pbuf));
+  FILE *f = fopen(rpath, "r");
+  if (!f) {
+    sh_err("terminator: %s: %s\n", path, strerror(errno));
+    return 127;
+  }
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (sz < 0) {
+    fclose(f);
+    return 1;
+  }
+  char *content = malloc((size_t)sz + 1);
+  if (!content) {
+    fclose(f);
+    return 1;
+  }
+  size_t nread = fread(content, 1, (size_t)sz, f);
+  content[nread] = '\0';
+  fclose(f);
+
+  /* Save previous positional parameters & state */
+  int saved_argc = script_argc;
+  char saved_argv[16][1024];
+  memcpy(saved_argv, script_argv, sizeof(saved_argv));
+  int saved_exit_req = shell_exit_requested;
+  int saved_exit_code = shell_exit_code;
+
+  script_argc = (argc > 1) ? (argc - 1) : 0;
+  if (script_argc > 15)
+    script_argc = 15;
+  for (int i = 0; i < argc && i < 16; i++)
+    snprintf(script_argv[i], sizeof(script_argv[i]), "%s", argv[i]);
+
+  execute_script_text(content);
+  free(content);
+
+  int rc = shell_exit_requested ? shell_exit_code : last_status;
+  /* An 'exit n' inside ./run.sh or bash run.sh exits the script, not the tab!
+   */
+  /* An 'exit n' inside 'source run.sh' runs in the current shell environment */
+  if (!is_sourced && shell_exit_requested) {
+    shell_exit_requested = saved_exit_req;
+    shell_exit_code = saved_exit_code;
+    last_status = rc;
+  }
+
+  script_argc = saved_argc;
+  memcpy(script_argv, saved_argv, sizeof(saved_argv));
+  return last_status;
+}
+
+/* Check if a file is a text/shell script (ends in .sh, starts with #!, or ASCII
+ * text) */
+static int is_text_script(const char *cmd_name) {
+  char pbuf[PATH_MAX * 2];
+  const char *rpath = resolve_path(cmd_name, pbuf, sizeof(pbuf));
+  struct stat st;
+  if (stat(rpath, &st) != 0 || !S_ISREG(st.st_mode))
+    return 0;
+  size_t len = strlen(cmd_name);
+  if (len >= 3 && strcmp(cmd_name + len - 3, ".sh") == 0)
+    return 1;
+  int fd = open(rpath, O_RDONLY);
+  if (fd < 0)
+    return 0;
+  unsigned char buf[64];
+  ssize_t n = read(fd, buf, sizeof(buf));
+  close(fd);
+  if (n >= 2 && buf[0] == '#' && buf[1] == '!')
+    return 1;
+  /* Check if non-ELF text file when invoked with a path like ./script */
+  if (n >= 4 && buf[0] == 0x7f && buf[1] == 'E' && buf[2] == 'L' &&
+      buf[3] == 'F')
+    return 0;
+  if (n >= 4 && ((buf[0] == 0xcf && buf[1] == 0xfa) ||
+                 (buf[0] == 0xfe && buf[1] == 0xed)))
+    return 0; /* Mach-O binary */
+  if (strchr(cmd_name, '/') != NULL && n > 0) {
+    int text_ok = 1;
+    for (ssize_t i = 0; i < n; i++) {
+      if (buf[i] == 0) {
+        text_ok = 0;
+        break;
+      }
+    }
+    return text_ok;
+  }
+  return 0;
+}
+
+static int execute_line(const char *line) { return execute_script_text(line); }
+
+/* Parse, expand and run one single command/pipeline line. */
+static int execute_single_line(const char *line) {
   /* multiWatch has its own list syntax, so handle it before tokenizing */
   const char *mw = line;
   while (*mw == ' ' || *mw == '\t')
@@ -1299,10 +1991,92 @@ static int execute_line(const char *line) {
   if (num_cmds == 1 && !infile[0] && !outfile[0] && !background) {
     char **argv = stage_argv[0];
     int argc = stage_argc[0];
-    if (argc == 0) {
+
+    /* Variable assignment: VAR=value (or multiple VAR1=v1 VAR2=v2) */
+    int all_assign = (argc > 0);
+    for (int a = 0; a < argc; a++) {
+      const char *eq = strchr(argv[a], '=');
+      if (!eq || eq == argv[a] ||
+          !(isalpha((unsigned char)argv[a][0]) || argv[a][0] == '_')) {
+        all_assign = 0;
+        break;
+      }
+      for (const char *k = argv[a]; k < eq; k++) {
+        if (!(isalnum((unsigned char)*k) || *k == '_')) {
+          all_assign = 0;
+          break;
+        }
+      }
+    }
+    if (all_assign) {
+      for (int a = 0; a < argc; a++) {
+        char *eq = strchr(argv[a], '=');
+        char vname[64];
+        size_t nlen = (size_t)(eq - argv[a]);
+        if (nlen >= sizeof(vname))
+          nlen = sizeof(vname) - 1;
+        memcpy(vname, argv[a], nlen);
+        vname[nlen] = '\0';
+        set_shell_var(vname, eq + 1);
+      }
+      last_status = 0;
+      tok_free(&tl);
+      return 0;
+    }
+
+    if (strcmp(argv[0], "export") == 0) {
+      for (int a = 1; a < argc; a++) {
+        char *eq = strchr(argv[a], '=');
+        if (eq && eq > argv[a]) {
+          char vname[64];
+          size_t nlen = (size_t)(eq - argv[a]);
+          if (nlen >= sizeof(vname))
+            nlen = sizeof(vname) - 1;
+          memcpy(vname, argv[a], nlen);
+          vname[nlen] = '\0';
+          set_shell_var(vname, eq + 1);
+        }
+      }
+      last_status = 0;
+      tok_free(&tl);
+      return 0;
+    }
+
+    if (strcmp(argv[0], "[") == 0 || strcmp(argv[0], "test") == 0) {
+      last_status = eval_bracket_test(argc, argv);
       tok_free(&tl);
       return last_status;
     }
+
+    if (strcmp(argv[0], "source") == 0 || strcmp(argv[0], ".") == 0) {
+      if (argc < 2) {
+        sh_err("terminator: %s: filename argument required\n", argv[0]);
+        last_status = 2;
+      } else {
+        last_status = run_script_file(argv[1], argc - 1, argv + 1, 1);
+      }
+      tok_free(&tl);
+      return last_status;
+    }
+
+    if ((strcmp(argv[0], "bash") == 0 || strcmp(argv[0], "sh") == 0) &&
+        argc >= 2) {
+      last_status = run_script_file(argv[1], argc - 1, argv + 1, 0);
+      tok_free(&tl);
+      return last_status;
+    }
+
+    if (is_text_script(argv[0])) {
+      last_status = run_script_file(argv[0], argc, argv, 0);
+      tok_free(&tl);
+      return last_status;
+    }
+  }
+
+  if (num_cmds == 1) {
+    char **argv = stage_argv[0];
+    int argc = stage_argc[0];
+
     if (strcmp(argv[0], "cd") == 0) {
       const char *dest = (argc > 1) ? argv[1] : getenv("HOME");
       char path_buf[1024];
@@ -1471,6 +2245,27 @@ static int execute_line(const char *line) {
       if (strcmp(stage_argv[s][0], "fg") == 0 ||
           strcmp(stage_argv[s][0], "bg") == 0) {
         _exit(0);
+      }
+      if (strcmp(stage_argv[s][0], "[") == 0 ||
+          strcmp(stage_argv[s][0], "test") == 0) {
+        _exit(eval_bracket_test(stage_argc[s], stage_argv[s]));
+      }
+      if (strcmp(stage_argv[s][0], "source") == 0 ||
+          strcmp(stage_argv[s][0], ".") == 0) {
+        if (stage_argc[s] < 2)
+          _exit(2);
+        _exit(run_script_file(stage_argv[s][1], stage_argc[s] - 1,
+                              stage_argv[s] + 1, 1));
+      }
+      if ((strcmp(stage_argv[s][0], "bash") == 0 ||
+           strcmp(stage_argv[s][0], "sh") == 0) &&
+          stage_argc[s] >= 2) {
+        _exit(run_script_file(stage_argv[s][1], stage_argc[s] - 1,
+                              stage_argv[s] + 1, 0));
+      }
+      if (is_text_script(stage_argv[s][0])) {
+        _exit(
+            run_script_file(stage_argv[s][0], stage_argc[s], stage_argv[s], 0));
       }
 
       execvp(stage_argv[s][0], stage_argv[s]);
