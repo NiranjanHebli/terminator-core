@@ -25,7 +25,7 @@
 
 #define MAX_TABS 10
 #define MAX_LINES 1000
-#define MAX_LINE_LEN 256
+#define MAX_LINE_LEN 512
 #define TAB_BAR_HEIGHT 32
 #define TAB_WIDTH 110
 #define ADD_BTN_WIDTH 36
@@ -82,6 +82,11 @@ static unsigned long col_prompt_user;
 static unsigned long col_prompt_arrow;
 static unsigned long col_text;
 static unsigned long col_cursor;
+static unsigned long col_path;
+static unsigned long col_branch;
+static unsigned long col_pill_bg;
+static unsigned long col_time;
+static unsigned long col_dim;
 
 static unsigned long get_hex_color(const char *hex) {
   Colormap cmap = DefaultColormap(dpy, scr);
@@ -149,6 +154,10 @@ typedef struct {
   int fg_pgid[MAX_TABS];
   /* each tab's busy state (1 = executing command, 0 = idle), used atomically */
   int busy[MAX_TABS];
+  long last_duration_ms[MAX_TABS];
+  int last_status[MAX_TABS];
+  int last_interrupted[MAX_TABS];
+  char last_time[MAX_TABS][32];
 } SharedState;
 
 static int use_process_mode = 0;
@@ -2667,12 +2676,39 @@ static void run_shell(void) {
       continue; /* need more input */
     }
 
+    struct timespec ts_start, ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
     set_tab_busy(1);
     history_add(cmd);
     execute_line(cmd);
     cmd_len = 0;
     cmd[0] = '\0';
     set_tab_busy(0);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    long elapsed_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000L +
+                      (ts_end.tv_nsec - ts_start.tv_nsec) / 1000000L;
+
+    if (tab_slot >= 0 && shared_state) {
+      __atomic_store_n(&shared_state->last_duration_ms[tab_slot], elapsed_ms,
+                       __ATOMIC_SEQ_CST);
+      __atomic_store_n(&shared_state->last_status[tab_slot], last_status,
+                       __ATOMIC_SEQ_CST);
+      if (last_status != 130) {
+        __atomic_store_n(&shared_state->last_interrupted[tab_slot], 0,
+                         __ATOMIC_SEQ_CST);
+      }
+      time_t now = time(NULL);
+      struct tm tm_i;
+      localtime_r(&now, &tm_i);
+      char tbuf[32];
+      strftime(tbuf, sizeof(tbuf), "%I:%M:%S %p", &tm_i);
+      shared_lock();
+      snprintf(shared_state->last_time[tab_slot],
+               sizeof(shared_state->last_time[tab_slot]), "%s", tbuf);
+      shared_unlock();
+    }
   }
 
   if (cmd_len > 0 && !shell_exit_requested) {
@@ -2770,6 +2806,17 @@ static void create_tab(void) {
   if (shared_state && slot >= 0 && slot < MAX_TABS) {
     __atomic_store_n(&shared_state->busy[slot], 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&shared_state->fg_pgid[slot], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&shared_state->last_duration_ms[slot], -1L,
+                     __ATOMIC_SEQ_CST);
+    __atomic_store_n(&shared_state->last_status[slot], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&shared_state->last_interrupted[slot], 0, __ATOMIC_SEQ_CST);
+    time_t now = time(NULL);
+    struct tm tm_i;
+    localtime_r(&now, &tm_i);
+    shared_lock();
+    strftime(shared_state->last_time[slot],
+             sizeof(shared_state->last_time[slot]), "%I:%M:%S %p", &tm_i);
+    shared_unlock();
   }
 
   int in_pipe[2];
@@ -2889,6 +2936,12 @@ static void close_tab(int idx) {
     __atomic_store_n(&shared_state->busy[tabs[idx].slot], 0,
                      __ATOMIC_SEQ_CST);
     __atomic_store_n(&shared_state->fg_pgid[tabs[idx].slot], 0,
+                     __ATOMIC_SEQ_CST);
+    __atomic_store_n(&shared_state->last_duration_ms[tabs[idx].slot], -1L,
+                     __ATOMIC_SEQ_CST);
+    __atomic_store_n(&shared_state->last_status[tabs[idx].slot], 0,
+                     __ATOMIC_SEQ_CST);
+    __atomic_store_n(&shared_state->last_interrupted[tabs[idx].slot], 0,
                      __ATOMIC_SEQ_CST);
   }
   if (tabs[idx].pid > 0) {
@@ -3158,6 +3211,338 @@ static void replace_input_range(Tab *cur, int start, int end,
   cur->input_pos = start + rlen;
 }
 
+static void abbreviate_path(const char *path, char *out, size_t max_len) {
+  const char *home = getenv("HOME");
+  if (home && *home) {
+    size_t hlen = strlen(home);
+    if (strncmp(path, home, hlen) == 0 &&
+        (path[hlen] == '/' || path[hlen] == '\0')) {
+      snprintf(out, max_len, "~%s", path + hlen);
+      return;
+    }
+  }
+  snprintf(out, max_len, "%s", path && *path ? path : ".");
+}
+
+static int get_git_branch(const char *dir, char *branch, size_t max_len) {
+  char cur[1024];
+  if (!dir || !*dir)
+    return 0;
+  snprintf(cur, sizeof(cur), "%s", dir);
+
+  for (int depth = 0; depth < 16; depth++) {
+    char head_path[1024];
+    snprintf(head_path, sizeof(head_path), "%s/.git/HEAD", cur);
+    FILE *f = fopen(head_path, "r");
+    if (f) {
+      char line[256];
+      if (fgets(line, sizeof(line), f)) {
+        fclose(f);
+        size_t l = strlen(line);
+        while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r' ||
+                         line[l - 1] == ' '))
+          line[--l] = '\0';
+        if (strncmp(line, "ref: refs/heads/", 16) == 0) {
+          snprintf(branch, max_len, "%s", line + 16);
+          return 1;
+        } else if (l > 0) {
+          if (l > 7)
+            line[7] = '\0';
+          snprintf(branch, max_len, "%s", line);
+          return 1;
+        }
+      } else {
+        fclose(f);
+      }
+    }
+    char git_path[1024];
+    snprintf(git_path, sizeof(git_path), "%s/.git", cur);
+    struct stat st;
+    if (stat(git_path, &st) == 0 && S_ISREG(st.st_mode)) {
+      FILE *gf = fopen(git_path, "r");
+      if (gf) {
+        char gline[512];
+        if (fgets(gline, sizeof(gline), gf)) {
+          fclose(gf);
+          if (strncmp(gline, "gitdir:", 7) == 0) {
+            char *p = gline + 7;
+            while (*p == ' ' || *p == '\t')
+              p++;
+            size_t gl = strlen(p);
+            while (gl > 0 && (p[gl - 1] == '\n' || p[gl - 1] == '\r'))
+              p[--gl] = '\0';
+            char real_head[1024];
+            if (p[0] == '/')
+              snprintf(real_head, sizeof(real_head), "%s/HEAD", p);
+            else
+              snprintf(real_head, sizeof(real_head), "%s/%s/HEAD", cur, p);
+            FILE *hf = fopen(real_head, "r");
+            if (hf) {
+              char hline[256];
+              if (fgets(hline, sizeof(hline), hf)) {
+                fclose(hf);
+                size_t hl = strlen(hline);
+                while (hl > 0 &&
+                       (hline[hl - 1] == '\n' || hline[hl - 1] == '\r'))
+                  hline[--hl] = '\0';
+                if (strncmp(hline, "ref: refs/heads/", 16) == 0) {
+                  snprintf(branch, max_len, "%s", hline + 16);
+                  return 1;
+                }
+              } else
+                fclose(hf);
+            }
+          }
+        } else
+          fclose(gf);
+      }
+    }
+
+    char *slash = strrchr(cur, '/');
+    if (!slash || slash == cur)
+      break;
+    *slash = '\0';
+  }
+  return 0;
+}
+
+static void format_duration(long ms, char *out, size_t max_len) {
+  if (ms < 0) {
+    out[0] = '\0';
+    return;
+  }
+  if (ms < 1000) {
+    snprintf(out, max_len, "took %ldms", ms);
+  } else if (ms < 60000) {
+    long s = ms / 1000;
+    snprintf(out, max_len, "took %lds", s);
+  } else if (ms < 3600000) {
+    long m = ms / 60000;
+    long s = (ms % 60000) / 1000;
+    snprintf(out, max_len, "took %ldm %lds", m, s);
+  } else {
+    long h = ms / 3600000;
+    long m = (ms % 3600000) / 60000;
+    long s = (ms % 60000) / 1000;
+    snprintf(out, max_len, "took %ldh %ldm %lds", h, m, s);
+  }
+}
+
+#define BAR_PREFIX "\001[BAR]\001"
+
+static int is_bar_line(const char *line) {
+  return strncmp(line, BAR_PREFIX, strlen(BAR_PREFIX)) == 0;
+}
+
+static void parse_bar_line(const char *line, char *cwd, size_t cwd_sz,
+                           char *branch, size_t branch_sz,
+                           char *dur_str, size_t dur_sz,
+                           char *time_str, size_t time_sz,
+                           int *right_is_err) {
+  cwd[0] = '\0';
+  branch[0] = '\0';
+  dur_str[0] = '\0';
+  time_str[0] = '\0';
+  *right_is_err = 0;
+
+  if (strncmp(line, BAR_PREFIX, strlen(BAR_PREFIX)) != 0)
+    return;
+
+  const char *p = line + strlen(BAR_PREFIX);
+  const char *t1 = strchr(p, '\t');
+  if (!t1) {
+    snprintf(cwd, cwd_sz, "%s", p);
+    return;
+  }
+  size_t len1 = (size_t)(t1 - p);
+  if (len1 >= cwd_sz)
+    len1 = cwd_sz - 1;
+  memcpy(cwd, p, len1);
+  cwd[len1] = '\0';
+
+  p = t1 + 1;
+  const char *t2 = strchr(p, '\t');
+  if (!t2) {
+    snprintf(branch, branch_sz, "%s", p);
+    return;
+  }
+  size_t len2 = (size_t)(t2 - p);
+  if (len2 >= branch_sz)
+    len2 = branch_sz - 1;
+  memcpy(branch, p, len2);
+  branch[len2] = '\0';
+
+  p = t2 + 1;
+  const char *t3 = strchr(p, '\t');
+  if (!t3) {
+    snprintf(dur_str, dur_sz, "%s", p);
+    return;
+  }
+  size_t len3 = (size_t)(t3 - p);
+  if (len3 >= dur_sz)
+    len3 = dur_sz - 1;
+  memcpy(dur_str, p, len3);
+  dur_str[len3] = '\0';
+
+  p = t3 + 1;
+  const char *t4 = strchr(p, '\t');
+  if (!t4) {
+    snprintf(time_str, time_sz, "%s", p);
+    return;
+  }
+  size_t len4 = (size_t)(t4 - p);
+  if (len4 >= time_sz)
+    len4 = time_sz - 1;
+  memcpy(time_str, p, len4);
+  time_str[len4] = '\0';
+
+  p = t4 + 1;
+  *right_is_err = atoi(p);
+}
+
+static void get_current_bar_info(Tab *cur, char *abbrev_cwd, size_t cwd_sz,
+                                 char *branch, size_t branch_sz,
+                                 char *dur_str, size_t dur_sz,
+                                 char *time_str, size_t time_sz,
+                                 int *right_is_err) {
+  abbreviate_path(cur->cwd, abbrev_cwd, cwd_sz);
+  if (!get_git_branch(cur->cwd, branch, branch_sz)) {
+    branch[0] = '\0';
+  }
+
+  long dur_ms = -1;
+  int is_int = 0;
+  int st = 0;
+  time_str[0] = '\0';
+  if (shared_state && cur->slot >= 0 && cur->slot < MAX_TABS) {
+    dur_ms = __atomic_load_n(&shared_state->last_duration_ms[cur->slot],
+                             __ATOMIC_SEQ_CST);
+    st = __atomic_load_n(&shared_state->last_status[cur->slot],
+                         __ATOMIC_SEQ_CST);
+    is_int = __atomic_load_n(&shared_state->last_interrupted[cur->slot],
+                             __ATOMIC_SEQ_CST);
+    shared_lock();
+    snprintf(time_str, time_sz, "%s", shared_state->last_time[cur->slot]);
+    shared_unlock();
+  }
+  if (!time_str[0]) {
+    time_t now = time(NULL);
+    struct tm tm_i;
+    localtime_r(&now, &tm_i);
+    strftime(time_str, time_sz, "%I:%M:%S %p", &tm_i);
+  }
+
+  dur_str[0] = '\0';
+  *right_is_err = 0;
+  if (is_int || st == 130) {
+    snprintf(dur_str, dur_sz, "INT");
+    *right_is_err = 1;
+  } else if (st != 0 && dur_ms >= 0) {
+    snprintf(dur_str, dur_sz, "ERR %d", st);
+    *right_is_err = 1;
+  } else if (dur_ms >= 0) {
+    format_duration(dur_ms, dur_str, dur_sz);
+  }
+}
+
+static void draw_status_bar(int draw_y, const char *abbrev_cwd, const char *branch,
+                            const char *dur_str, const char *time_str,
+                            int right_is_err, int win_w) {
+  int has_branch = (branch && branch[0] != '\0');
+  int left_chars =
+      (int)strlen(abbrev_cwd) + (has_branch ? (6 + (int)strlen(branch)) : 0);
+  int right_chars =
+      (dur_str && dur_str[0] ? ((int)strlen(dur_str) + 6) : 3) + (int)strlen(time_str);
+
+  int pad = 8;
+  int left_w = left_chars * char_width + pad * 2;
+  int right_w = right_chars * char_width + pad * 2;
+  int pill_h = char_height + 4;
+  int pill_y = draw_y - font_ascent - 2;
+
+  int left_x = 16;
+  int right_x = win_w - 16 - right_w;
+  if (right_x < left_x + left_w + 16)
+    right_x = left_x + left_w + 16;
+
+  // Draw left pill background
+  XSetForeground(dpy, gc, col_pill_bg);
+  XFillRectangle(dpy, win, gc, left_x, pill_y, left_w, pill_h);
+
+  // Draw connector dashes in between
+  int dash_start_x = left_x + left_w + 4;
+  int dash_end_x = right_x - 4;
+  if (dash_end_x > dash_start_x) {
+    int ndashes = (dash_end_x - dash_start_x) / char_width;
+    if (ndashes > 0) {
+      char dashes[256];
+      if (ndashes > (int)sizeof(dashes) - 1)
+        ndashes = sizeof(dashes) - 1;
+      memset(dashes, '-', ndashes);
+      dashes[ndashes] = '\0';
+      XSetForeground(dpy, gc, col_tab_border);
+      XDrawString(dpy, win, gc, dash_start_x, draw_y, dashes, ndashes);
+    }
+  }
+
+  // Draw right pill background
+  XSetForeground(dpy, gc, col_pill_bg);
+  XFillRectangle(dpy, win, gc, right_x, pill_y, right_w, pill_h);
+
+  // Render text inside left pill
+  int cur_x = left_x + pad;
+  XSetForeground(dpy, gc, col_path);
+  XDrawString(dpy, win, gc, cur_x, draw_y, abbrev_cwd, strlen(abbrev_cwd));
+  cur_x += strlen(abbrev_cwd) * char_width;
+
+  if (has_branch) {
+    const char *pipe_on = " | on ";
+    XSetForeground(dpy, gc, col_dim);
+    XDrawString(dpy, win, gc, cur_x, draw_y, pipe_on, strlen(pipe_on));
+    cur_x += strlen(pipe_on) * char_width;
+
+    XSetForeground(dpy, gc, col_branch);
+    XDrawString(dpy, win, gc, cur_x, draw_y, branch, strlen(branch));
+  }
+
+  // Render text inside right pill
+  int r_cur_x = right_x + pad;
+  if (dur_str && dur_str[0]) {
+    XSetForeground(dpy, gc, right_is_err ? col_prompt_arrow : col_text);
+    XDrawString(dpy, win, gc, r_cur_x, draw_y, dur_str, strlen(dur_str));
+    r_cur_x += strlen(dur_str) * char_width;
+
+    const char *pipe_at = " | at ";
+    XSetForeground(dpy, gc, col_dim);
+    XDrawString(dpy, win, gc, r_cur_x, draw_y, pipe_at, strlen(pipe_at));
+    r_cur_x += strlen(pipe_at) * char_width;
+  } else {
+    const char *at_str = "at ";
+    XSetForeground(dpy, gc, col_dim);
+    XDrawString(dpy, win, gc, r_cur_x, draw_y, at_str, strlen(at_str));
+    r_cur_x += strlen(at_str) * char_width;
+  }
+
+  XSetForeground(dpy, gc, col_time);
+  XDrawString(dpy, win, gc, r_cur_x, draw_y, time_str, strlen(time_str));
+}
+
+static void append_status_bar_line(Tab *cur) {
+  char cwd[512], br[64], dur[64], tm[32];
+  int err = 0;
+  get_current_bar_info(cur, cwd, sizeof(cwd), br, sizeof(br), dur, sizeof(dur),
+                       tm, sizeof(tm), &err);
+
+  char bar_line[1024];
+  snprintf(bar_line, sizeof(bar_line), "%s%s\t%s\t%s\t%s\t%d\n", BAR_PREFIX,
+           cwd, br, dur, tm, err);
+
+  if (cur->line_count > 0) {
+    tab_append_text(cur, "\n", 1);
+  }
+  tab_append_text(cur, bar_line, (int)strlen(bar_line));
+}
+
 static void handle_tab_completion(Tab *cur) {
   cur->completing = 0;
   cur->comp_count = 0;
@@ -3263,11 +3648,17 @@ static void handle_tab_completion(Tab *cur) {
   cur->comp_replace_start = replace_start;
   cur->completing = 1;
 
+  if (cur->pending_len == 0) {
+    append_status_bar_line(cur);
+  }
+
   /* Echo current prompt + line and the numbered list to the terminal buffer */
-  char echo_line[1200];
-  snprintf(echo_line, sizeof(echo_line), "%s%s\n",
-           cur->pending_len > 0 ? CONT_PROMPT : "user@terminator> ",
-           cur->input);
+  char echo_line[1400];
+  if (cur->pending_len > 0) {
+    snprintf(echo_line, sizeof(echo_line), "%s%s\n", CONT_PROMPT, cur->input);
+  } else {
+    snprintf(echo_line, sizeof(echo_line), "user@terminator> %s\n", cur->input);
+  }
   tab_append_text(cur, echo_line, (int)strlen(echo_line));
 
   char list_buf[2048];
@@ -3326,20 +3717,40 @@ static void redraw(int win_w, int win_h) {
   Tab *cur = &tabs[active_tab];
 
   int content_top = TAB_BAR_HEIGHT + 16;
-  int max_visible = (win_h - content_top - 36) / char_height;
-  if (max_visible < 1)
-    max_visible = 1;
+  int prompt_height =
+      tab_is_busy(active_tab)
+          ? 0
+          : ((cur->pending_len > 0 ? 1 : 2) * char_height + 14);
+  int avail_h = win_h - content_top - prompt_height;
+  if (avail_h < char_height)
+    avail_h = char_height;
 
-  int start_line = 0;
-  if (cur->line_count > max_visible) {
-    start_line = cur->line_count - max_visible;
+  int used_h = 0;
+  int start_line = cur->line_count;
+  while (start_line > 0) {
+    int lh = is_bar_line(cur->lines[start_line - 1]) ? (char_height + 6)
+                                                     : char_height;
+    if (used_h + lh > avail_h && start_line < cur->line_count)
+      break;
+    used_h += lh;
+    start_line--;
   }
 
-  XSetForeground(dpy, gc, col_text);
   int draw_y = content_top;
   for (int i = start_line; i < cur->line_count; i++) {
-    XDrawString(dpy, win, gc, 16, draw_y, cur->lines[i], strlen(cur->lines[i]));
-    draw_y += char_height;
+    if (is_bar_line(cur->lines[i])) {
+      char cwd[512], br[64], dur[64], tm[32];
+      int right_is_err = 0;
+      parse_bar_line(cur->lines[i], cwd, sizeof(cwd), br, sizeof(br), dur,
+                     sizeof(dur), tm, sizeof(tm), &right_is_err);
+      draw_status_bar(draw_y, cwd, br, dur, tm, right_is_err, win_w);
+      draw_y += char_height + 6;
+    } else {
+      XSetForeground(dpy, gc, col_text);
+      XDrawString(dpy, win, gc, 16, draw_y, cur->lines[i],
+                  strlen(cur->lines[i]));
+      draw_y += char_height;
+    }
   }
 
   if (cur->searching) {
@@ -3356,16 +3767,40 @@ static void redraw(int win_w, int win_h) {
     XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
                    char_height);
   } else if (!tab_is_busy(active_tab)) {
-    /* Continuation lines of a multiline command only show the "> " prompt */
-    const char *prompt_user = cur->pending_len > 0 ? "" : "user@terminator";
-    const char *prompt_arrow = cur->pending_len > 0 ? CONT_PROMPT : "> ";
-    XSetForeground(dpy, gc, col_prompt_user);
-    XDrawString(dpy, win, gc, 16, draw_y, prompt_user, strlen(prompt_user));
-    int px = 16 + strlen(prompt_user) * char_width;
+    char abbrev_cwd[512];
+    abbreviate_path(cur->cwd, abbrev_cwd, sizeof(abbrev_cwd));
 
-    XSetForeground(dpy, gc, col_prompt_arrow);
-    XDrawString(dpy, win, gc, px, draw_y, prompt_arrow, strlen(prompt_arrow));
-    px += strlen(prompt_arrow) * char_width;
+    if (cur->pending_len == 0) {
+      char branch[64];
+      char dur_str[64];
+      char time_str[32];
+      int right_is_err = 0;
+      get_current_bar_info(cur, abbrev_cwd, sizeof(abbrev_cwd), branch,
+                           sizeof(branch), dur_str, sizeof(dur_str), time_str,
+                           sizeof(time_str), &right_is_err);
+
+      draw_status_bar(draw_y, abbrev_cwd, branch, dur_str, time_str,
+                      right_is_err, win_w);
+      draw_y += char_height + 6;
+    }
+
+    // Now render the input prompt line
+    int px = 16;
+    if (cur->pending_len > 0) {
+      XSetForeground(dpy, gc, col_prompt_arrow);
+      XDrawString(dpy, win, gc, px, draw_y, CONT_PROMPT, strlen(CONT_PROMPT));
+      px += strlen(CONT_PROMPT) * char_width;
+    } else {
+      const char *user_str = "user@terminator";
+      XSetForeground(dpy, gc, col_prompt_user);
+      XDrawString(dpy, win, gc, px, draw_y, user_str, strlen(user_str));
+      px += strlen(user_str) * char_width;
+
+      const char *arr = "> ";
+      XSetForeground(dpy, gc, col_prompt_arrow);
+      XDrawString(dpy, win, gc, px, draw_y, arr, strlen(arr));
+      px += strlen(arr) * char_width;
+    }
 
     XSetForeground(dpy, gc, col_text);
     XDrawString(dpy, win, gc, px, draw_y, cur->input, cur->input_len);
@@ -3445,6 +3880,11 @@ int main(int argc, char **argv) {
   col_prompt_arrow = get_hex_color("#f38ba8");
   col_text = get_hex_color("#cdd6f4");
   col_cursor = get_hex_color("#f5e0dc");
+  col_path = get_hex_color("#89b4fa");
+  col_branch = get_hex_color("#a6e3a1");
+  col_pill_bg = get_hex_color("#242535");
+  col_time = get_hex_color("#94e2d5");
+  col_dim = get_hex_color("#6c7086");
 
   font = XLoadQueryFont(dpy, "9x15");
   if (!font)
@@ -3609,6 +4049,18 @@ int main(int argc, char **argv) {
                                  __ATOMIC_SEQ_CST);
               }
             }
+            if (shared_state && cur->slot >= 0 && cur->slot < MAX_TABS) {
+              __atomic_store_n(&shared_state->last_interrupted[cur->slot], 1,
+                               __ATOMIC_SEQ_CST);
+              time_t now = time(NULL);
+              struct tm tm_i;
+              localtime_r(&now, &tm_i);
+              shared_lock();
+              strftime(shared_state->last_time[cur->slot],
+                       sizeof(shared_state->last_time[cur->slot]), "%I:%M:%S %p",
+                       &tm_i);
+              shared_unlock();
+            }
             cur->input_len = 0;
             cur->input_pos = 0;
             cur->input[0] = '\0';
@@ -3707,8 +4159,15 @@ int main(int argc, char **argv) {
           case ACT_INTERRUPT: {
             /* signal the foreground job, else make the shell drop the line */
             int job_signalled = signal_tab_job(active_tab, SIGINT);
-            tab_append_text(cur, "^C\n", 3);
             if (!job_signalled) {
+              if (cur->pending_len == 0) {
+                append_status_bar_line(cur);
+              }
+              char echo_line[1400];
+              snprintf(echo_line, sizeof(echo_line), "user@terminator> %s^C\n",
+                       cur->input);
+              tab_append_text(cur, echo_line, strlen(echo_line));
+
               cur->input_len = 0;
               cur->input_pos = 0;
               cur->input[0] = '\0';
@@ -3716,6 +4175,20 @@ int main(int argc, char **argv) {
               cur->pending[0] = '\0';
               cur->hist_pos = 0;
               write_all(cur->in_fd, "\003", 1);
+            } else {
+              tab_append_text(cur, "^C\n", 3);
+            }
+            if (shared_state && cur->slot >= 0 && cur->slot < MAX_TABS) {
+              __atomic_store_n(&shared_state->last_interrupted[cur->slot], 1,
+                               __ATOMIC_SEQ_CST);
+              time_t now = time(NULL);
+              struct tm tm_i;
+              localtime_r(&now, &tm_i);
+              shared_lock();
+              strftime(shared_state->last_time[cur->slot],
+                       sizeof(shared_state->last_time[cur->slot]), "%I:%M:%S %p",
+                       &tm_i);
+              shared_unlock();
             }
             redraw(win_w, win_h);
             break;
@@ -3888,10 +4361,18 @@ int main(int argc, char **argv) {
                 redraw(win_w, win_h);
               }
             } else if (ks == XK_Return) {
-              char echo_line[1200];
-              snprintf(echo_line, sizeof(echo_line), "%s%s\n",
-                       cur->pending_len > 0 ? CONT_PROMPT : "user@terminator> ",
-                       cur->input);
+              if (cur->pending_len == 0) {
+                append_status_bar_line(cur);
+              }
+
+              char echo_line[1400];
+              if (cur->pending_len > 0) {
+                snprintf(echo_line, sizeof(echo_line), "%s%s\n", CONT_PROMPT,
+                         cur->input);
+              } else {
+                snprintf(echo_line, sizeof(echo_line),
+                         "user@terminator> %s\n", cur->input);
+              }
               tab_append_text(cur, echo_line, strlen(echo_line));
 
               write(cur->in_fd, cur->input, cur->input_len);
