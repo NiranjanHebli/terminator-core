@@ -147,6 +147,8 @@ typedef struct {
   char clipboard[4096];
   /* each tab's foreground process group (0 = none), used atomically */
   int fg_pgid[MAX_TABS];
+  /* each tab's busy state (1 = executing command, 0 = idle), used atomically */
+  int busy[MAX_TABS];
 } SharedState;
 
 static int use_process_mode = 0;
@@ -221,6 +223,7 @@ static int shared_init(void) {
   if (m == MAP_FAILED)
     return -1;
   shared_state = m;
+  memset(shared_state, 0, sizeof(SharedState));
 
   shared_sem = sem_open(sem_name, O_CREAT | O_EXCL, 0600, 1);
   if (shared_sem == SEM_FAILED)
@@ -567,6 +570,12 @@ static void set_foreground(pid_t pgid) {
                      __ATOMIC_SEQ_CST);
   else
     headless_fg_pgid = pgid;
+}
+
+/* Mark this tab as busy executing a command (1) or idle waiting for input (0) */
+static void set_tab_busy(int b) {
+  if (tab_slot >= 0 && shared_state)
+    __atomic_store_n(&shared_state->busy[tab_slot], b, __ATOMIC_SEQ_CST);
 }
 
 static int jobs_full(void) {
@@ -2620,6 +2629,7 @@ static void run_shell(void) {
   int n;
 
   cmd[0] = '\0';
+  set_tab_busy(0);
   while (!shell_exit_requested &&
          (n = read_line(&rd, tab_in_fd, line, sizeof(line), &interrupted)) >=
              0) {
@@ -2629,18 +2639,22 @@ static void run_shell(void) {
     if (interrupted) {
       cmd_len = 0;
       cmd[0] = '\0';
+      set_tab_busy(0);
     }
     /* announce finished background jobs, but not mid multiline command */
     if (cmd_len == 0)
       reap_jobs();
-    if (len == 0 && cmd_len == 0)
+    if (len == 0 && cmd_len == 0) {
+      set_tab_busy(0);
       continue;
+    }
 
     if (cmd_len + len + 2 > sizeof(cmd)) {
       sh_err("terminator: command too long\n");
       cmd_len = 0;
       cmd[0] = '\0';
       last_status = 1;
+      set_tab_busy(0);
       continue;
     }
     if (cmd_len > 0)
@@ -2648,18 +2662,23 @@ static void run_shell(void) {
     memcpy(cmd + cmd_len, line, len + 1);
     cmd_len += len;
 
-    if (input_status(cmd) != INPUT_COMPLETE)
+    if (input_status(cmd) != INPUT_COMPLETE) {
+      set_tab_busy(0);
       continue; /* need more input */
+    }
 
+    set_tab_busy(1);
     history_add(cmd);
     execute_line(cmd);
     cmd_len = 0;
     cmd[0] = '\0';
+    set_tab_busy(0);
   }
 
   if (cmd_len > 0 && !shell_exit_requested) {
     sh_err("terminator: syntax error: unexpected end of input\n");
   }
+  set_tab_busy(0);
 }
 
 /* ---- tabs: one shell per tab, as a thread or as a process ---- */
@@ -2671,11 +2690,13 @@ static void tab_main(int in_fd, int out_fd, int slot) {
   cur_stdout_fd = out_fd;
   tab_slot = slot;
   last_status = 0;
+  set_tab_busy(0);
   if (!getcwd(tab_cwd, sizeof(tab_cwd)))
     snprintf(tab_cwd, sizeof(tab_cwd), "/");
   run_shell();
   jobs_hangup();
   set_foreground(0);
+  set_tab_busy(0);
   close(in_fd);
   close(out_fd);
 }
@@ -2703,12 +2724,26 @@ static pid_t tab_foreground_pgid(int idx) {
   return (pid_t)__atomic_load_n(&shared_state->fg_pgid[s], __ATOMIC_SEQ_CST);
 }
 
+/* Check whether tab idx is currently executing a command or foreground process */
+static int tab_is_busy(int idx) {
+  if (!shared_state || idx < 0 || idx >= tab_count)
+    return 0;
+  int s = tabs[idx].slot;
+  if (s < 0 || s >= MAX_TABS)
+    return 0;
+  if (tab_foreground_pgid(idx) > 0)
+    return 1;
+  return __atomic_load_n(&shared_state->busy[s], __ATOMIC_SEQ_CST) != 0;
+}
+
 /* Signal only tab idx's foreground job group; returns 1 if signalled */
 static int signal_tab_job(int idx, int sig) {
   pid_t g = tab_foreground_pgid(idx);
   if (g <= 1 || g == getpgrp())
     return 0;
-  return kill(-g, sig) == 0;
+  if (kill(-g, sig) == 0)
+    return 1;
+  return kill(g, sig) == 0;
 }
 
 static void create_tab(void) {
@@ -2731,6 +2766,11 @@ static void create_tab(void) {
   }
   if (slot < 0)
     return;
+
+  if (shared_state && slot >= 0 && slot < MAX_TABS) {
+    __atomic_store_n(&shared_state->busy[slot], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&shared_state->fg_pgid[slot], 0, __ATOMIC_SEQ_CST);
+  }
 
   int in_pipe[2];
   int out_pipe[2];
@@ -2846,6 +2886,8 @@ static void close_tab(int idx) {
     tabs[idx].out_fd = -1;
   }
   if (shared_state && tabs[idx].slot >= 0 && tabs[idx].slot < MAX_TABS) {
+    __atomic_store_n(&shared_state->busy[tabs[idx].slot], 0,
+                     __ATOMIC_SEQ_CST);
     __atomic_store_n(&shared_state->fg_pgid[tabs[idx].slot], 0,
                      __ATOMIC_SEQ_CST);
   }
@@ -3313,7 +3355,7 @@ static void redraw(int win_w, int win_h) {
     XSetForeground(dpy, gc, col_cursor);
     XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
                    char_height);
-  } else {
+  } else if (!tab_is_busy(active_tab)) {
     /* Continuation lines of a multiline command only show the "> " prompt */
     const char *prompt_user = cur->pending_len > 0 ? "" : "user@terminator";
     const char *prompt_arrow = cur->pending_len > 0 ? CONT_PROMPT : "> ";
@@ -3431,6 +3473,8 @@ int main(int argc, char **argv) {
   create_tab();
 
   int running = 1;
+  int last_busy = -1;
+  int last_active_tab = -1;
   while (running) {
     struct pollfd pfds[MAX_TABS + 1];
     pfds[0].fd = ConnectionNumber(dpy);
@@ -3445,7 +3489,14 @@ int main(int argc, char **argv) {
       }
     }
 
-    int poll_timeout = XPending(dpy) ? 0 : 50;
+    int any_busy = 0;
+    for (int i = 0; i < tab_count; i++) {
+      if (tab_is_busy(i)) {
+        any_busy = 1;
+        break;
+      }
+    }
+    int poll_timeout = XPending(dpy) ? 0 : (any_busy ? 10 : 50);
     int poll_res = poll(pfds, pfd_count, poll_timeout);
 
     if (poll_res > 0) {
@@ -3489,6 +3540,13 @@ int main(int argc, char **argv) {
 
     if (!running)
       break;
+
+    int cur_busy = tab_is_busy(active_tab);
+    if (cur_busy != last_busy || active_tab != last_active_tab) {
+      last_busy = cur_busy;
+      last_active_tab = active_tab;
+      redraw(win_w, win_h);
+    }
 
     while (XPending(dpy)) {
       XEvent ev;
@@ -3538,6 +3596,43 @@ int main(int argc, char **argv) {
             action = (ActionId)a;
             break;
           }
+        }
+
+        if (tab_is_busy(active_tab)) {
+          if (action == ACT_INTERRUPT) {
+            int job_signalled = signal_tab_job(active_tab, SIGINT);
+            tab_append_text(cur, "^C\n", 3);
+            if (!job_signalled) {
+              write_all(cur->in_fd, "\003", 1);
+              if (shared_state && cur->slot >= 0 && cur->slot < MAX_TABS) {
+                __atomic_store_n(&shared_state->busy[cur->slot], 0,
+                                 __ATOMIC_SEQ_CST);
+              }
+            }
+            cur->input_len = 0;
+            cur->input_pos = 0;
+            cur->input[0] = '\0';
+            cur->pending_len = 0;
+            cur->pending[0] = '\0';
+            cur->hist_pos = 0;
+            redraw(win_w, win_h);
+          } else if (action == ACT_SUSPEND) {
+            if (signal_tab_job(active_tab, SIGTSTP)) {
+              tab_append_text(cur, "^Z\n", 3);
+              redraw(win_w, win_h);
+            }
+          } else if (action == ACT_NEW_TAB) {
+            create_tab();
+            redraw(win_w, win_h);
+          } else if (action == ACT_CLOSE_TAB) {
+            close_tab(active_tab);
+            if (tab_count == 0) {
+              running = 0;
+            } else {
+              redraw(win_w, win_h);
+            }
+          }
+          continue;
         }
 
         if (cur->searching) {
@@ -3803,7 +3898,16 @@ int main(int argc, char **argv) {
               write(cur->in_fd, "\n", 1);
 
               /* track the command like the shell does, to pick the prompt */
-              if (!(cur->input_len == 0 && cur->pending_len == 0)) {
+              int is_blank = 1;
+              for (int i = 0; i < cur->input_len; i++) {
+                if (!isspace((unsigned char)cur->input[i])) {
+                  is_blank = 0;
+                  break;
+                }
+              }
+              if (is_blank && cur->pending_len == 0) {
+                /* Blank line: shell prompt returns immediately */
+              } else {
                 if (cur->pending_len + cur->input_len + 2 > MAX_CMD_LEN) {
                   cur->pending_len = 0;
                 } else {
@@ -3812,8 +3916,13 @@ int main(int argc, char **argv) {
                   memcpy(cur->pending + cur->pending_len, cur->input,
                          cur->input_len + 1);
                   cur->pending_len += cur->input_len;
-                  if (input_status(cur->pending) == INPUT_COMPLETE)
+                  if (input_status(cur->pending) == INPUT_COMPLETE) {
                     cur->pending_len = 0;
+                    if (shared_state && cur->slot >= 0 && cur->slot < MAX_TABS) {
+                      __atomic_store_n(&shared_state->busy[cur->slot], 1,
+                                       __ATOMIC_SEQ_CST);
+                    }
+                  }
                 }
                 cur->pending[cur->pending_len] = '\0';
               }
