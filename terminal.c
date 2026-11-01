@@ -54,6 +54,7 @@ typedef struct {
   char comp_matches[64][256];
   int comp_count;
   int comp_replace_start;
+  int unread_activity; /* 1 = background tab has new output or finished a job */
   char cwd[PATH_MAX];
   char lines[MAX_LINES][MAX_LINE_LEN];
   int line_count;
@@ -3097,6 +3098,7 @@ static void create_tab(void) {
   t->completing = 0;
   t->comp_count = 0;
   t->comp_replace_start = 0;
+  t->unread_activity = 0;
   if (!getcwd(t->cwd, sizeof(t->cwd)))
     snprintf(t->cwd, sizeof(t->cwd), ".");
   t->line_count = 0;
@@ -4081,6 +4083,10 @@ static void redraw(int win_w, int win_h) {
     XDrawRectangle(dpy, win, gc, x, y, w, h);
     XDrawString(dpy, win, gc, x + 10, y + font_ascent + 2, tabs[i].title,
                 strlen(tabs[i].title));
+    if (tabs[i].unread_activity && i != active_tab) {
+      XSetForeground(dpy, gc, col_tab_active_fg);
+      XFillArc(dpy, win, gc, x + w - 14, y + (h - 8) / 2, 8, 8, 0, 360 * 64);
+    }
   }
 
   int add_x = 8 + tab_count * (TAB_WIDTH + 6);
@@ -4308,6 +4314,7 @@ int main(int argc, char **argv) {
   int running = 1;
   int last_busy = -1;
   int last_active_tab = -1;
+  int prev_tab_busy[MAX_TABS] = {0};
   while (running) {
     struct pollfd pfds[MAX_TABS + 1];
     pfds[0].fd = ConnectionNumber(dpy);
@@ -4342,16 +4349,16 @@ int main(int argc, char **argv) {
             if (n > 0) {
               buf[n] = '\0';
               tab_append_text(&tabs[i], buf, n);
+              if (i != active_tab) {
+                tabs[i].unread_activity = 1;
+                XBell(dpy, 0);
+              }
               if (strstr(buf, "[cwd: ")) {
                 char *p = strstr(buf, "[cwd: ") + 6;
                 char *end = strchr(p, ']');
                 if (end) {
                   *end = '\0';
                   snprintf(tabs[i].cwd, sizeof(tabs[i].cwd), "%s", p);
-                  char *slash = strrchr(p, '/');
-                  const char *bname = (slash && *(slash + 1)) ? slash + 1 : p;
-                  snprintf(tabs[i].title, sizeof(tabs[i].title), "%d: %s",
-                           tabs[i].id, bname);
                 }
               }
               redraw(win_w, win_h);
@@ -4374,10 +4381,24 @@ int main(int argc, char **argv) {
     if (!running)
       break;
 
+    int badge_changed = 0;
+    for (int i = 0; i < tab_count; i++) {
+      int b = tab_is_busy(i);
+      if (prev_tab_busy[i] == 1 && b == 0 && i != active_tab) {
+        tabs[i].unread_activity = 1;
+        XBell(dpy, 0);
+        badge_changed = 1;
+      }
+      prev_tab_busy[i] = b;
+    }
+
     int cur_busy = tab_is_busy(active_tab);
-    if (cur_busy != last_busy || active_tab != last_active_tab) {
+    if (cur_busy != last_busy || active_tab != last_active_tab ||
+        badge_changed) {
       last_busy = cur_busy;
       last_active_tab = active_tab;
+      if (active_tab >= 0 && active_tab < tab_count)
+        tabs[active_tab].unread_activity = 0;
       redraw(win_w, win_h);
     }
 
@@ -4399,6 +4420,7 @@ int main(int argc, char **argv) {
             int tx = 8 + i * (TAB_WIDTH + 6);
             if (bx >= tx && bx <= tx + TAB_WIDTH) {
               active_tab = i;
+              tabs[i].unread_activity = 0;
               redraw(win_w, win_h);
               break;
             }

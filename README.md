@@ -127,7 +127,6 @@ cp sample.terminatorrc ~/.terminatorrc
 ### Command Execution Engine & Built-ins
 - **Command Lifecycle:** Spawns external binaries via `fork()` $\to$ `execvp()` $\to$ `waitpid()`.
 - **Built-in `cd`:** Changes directory with `chdir()` directly inside the tab shell, supporting `cd`, `cd ~`, `cd ..`, and relative/absolute paths.
-- **Dynamic Tab Titles:** Each tab dynamically updates its title to display its active directory (e.g., `1: terminal_demo`).
 - **Built-in `exit`:** Gracefully exits tab process and frees pipe descriptors.
 - **Return Status Tracking (`$?`):** Tracks exit codes of commands and built-ins, expanding `$?` expressions (e.g., `echo $?`).
 - **Standard Error Integration:** Child `stderr` is multiplexed with `stdout`, routing error diagnostics (such as `command not found`) straight to the terminal window.
@@ -249,4 +248,9 @@ bind delete-word Alt+Backspace
 - **Quote styling:** Single and double-quoted strings are highlighted in peach (`#fab387`).
 - **Fish-style ghost suggestions:** Automatically renders matching command tails from history in dimmed gray ahead of the cursor.
 - **Right Arrow acceptance:** Pressing `→` at the end of the input line instantly accepts the ghost suggestion.
+
+#### Background Tab Activity Badges & Audio Alerts
+- **Unread notification dot:** When a background tab produces output or completes a running task, a colored notification badge appears on its tab bar.
+- **X11 notification bell:** Triggers an audible alert (`XBell`) when background tasks generate output or finish executing.
+- **Auto-dismiss on focus:** Switching to or clicking on an unread tab instantly dismisses its notification dot.
 

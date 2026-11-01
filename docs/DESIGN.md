@@ -130,6 +130,13 @@ flowchart TD
     class REDRAW render;
 ```
 
+### 2.3 Background Tab Activity Notifications & Audible Bell
+Terminator continuously monitors pipe descriptors and process states for hidden background tabs:
+- **Unread Activity Indicators:** When a background tab receives stdout/stderr data or when a background job finishes execution, `tabs[i].unread_activity` is flagged.
+- **Tab Bar Visual Badge:** `redraw()` paints a circular notification dot on the tab bar in `col_tab_active_fg` to alert the user of new activity without requiring tab switching.
+- **Audible Alerts:** Dispatches `XBell(dpy, 0)` upon background activity or task completion.
+- **Automatic Dismissal:** Clicking or switching to the tab immediately clears the unread badge.
+
 ---
 
 ## 3. Concurrency Models & Shared State Synchronization
@@ -432,7 +439,7 @@ typedef struct {
   pid_t pid;                  // Worker process ID (Process Mode)
   int in_fd;                  // Pipe write-end (GUI -> Shell stdin)
   int out_fd;                 // Pipe read-end (Shell stdout/stderr -> GUI)
-  char title[32];             // Visual tab title (e.g., "1: terminal_demo")
+  char title[32];             // Visual tab title (e.g., "1: tab")
   char cwd[PATH_MAX];         // Current working directory
   
   // Interactive Input Line Editing
@@ -449,6 +456,7 @@ typedef struct {
   char comp_matches[64][256];
   int comp_count;
   int comp_replace_start;
+  int unread_activity;        // 1 = background tab has new output or finished a job
   
   // Terminal Display Buffer
   char lines[MAX_LINES][MAX_LINE_LEN]; // 1000 lines x 512 chars
