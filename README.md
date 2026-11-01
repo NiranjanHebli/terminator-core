@@ -45,8 +45,6 @@ make clean
 ## Documentation
 
 - **System Design Document:** Detailed architecture, concurrency models, synchronization, data structures, IPC, and signals: [docs/DESIGN.md](docs/DESIGN.md).
-- **Comprehensive Demo Guide:** Complete step-by-step walkthrough of all features: [assignment/demo.txt](assignment/demo.txt).
-- **Slide Reference Specifications:** Course assignment reference: [assignment/REQUIREMENTS_ACT_1_TO_5.md](assignment/REQUIREMENTS_ACT_1_TO_5.md).
 
 ---
 
@@ -64,7 +62,7 @@ Terminator provides two execution architectures presenting identical behaviors:
 
 ## Quick Demo Commands
 
-### 1. Test Script Execution (Slide 30)
+### 1. Test Script Execution
 Run the bundled test script [check.sh](check.sh) natively inside Terminator:
 ```bash
 ./check.sh terminal.c            # Tests [ -f ] true branch: compiles myprog
@@ -223,14 +221,14 @@ bind delete-word Alt+Backspace
 #### Persistent History & Reverse Search
 - **Persistent storage:** history is saved to `~/.terminator_history` (or `$TERMINATOR_HISTFILE`), storing up to 10,000 commands across restarts.
 - **Shared across tabs:** commands entered in any tab are immediately appended to disk and visible to all tabs (both thread and process modes).
-- **`Ctrl+R` Reverse Search:** prompts `Enter search term: ` with slide 28 matching rules:
+- **`Ctrl+R` Reverse Search:** prompts `Enter search term: ` with prioritized matching rules:
   1. Exact match: displays the most recent matching command.
   2. Longest common substring match: displays commands sharing the longest substring if longer than 2 characters.
   3. Otherwise displays `No match for search term in history`.
 
 #### Tab Filename Auto-Completion
 - **Directory-aware matching:** pressing `Tab` scans the current directory for filenames matching the word before the cursor.
-- **Completion rules (Slide 29):**
+- **Completion rules:**
   1. Single match: completes filename immediately, preserving the rest of the command line.
   2. Several matches: extends input to the longest common prefix (LCP), then displays a numbered list of candidates and waits for a numeric selection (`1`..`9`).
   3. No match: does nothing.

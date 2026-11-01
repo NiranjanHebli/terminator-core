@@ -3200,7 +3200,7 @@ static void load_config(void) {
   fclose(f);
 }
 
-/* ---- Task 10: Tab filename auto-completion (Slide 31) ---- */
+/* ---- Task 10: Tab filename auto-completion ---- */
 static int cmp_str_ptr(const void *a, const void *b) {
   return strcmp((const char *)a, (const char *)b);
 }
@@ -3621,14 +3621,14 @@ static void handle_tab_completion(Tab *cur) {
   closedir(d);
 
   if (cur->comp_count == 0) {
-    return; /* No match: do nothing (Slide 31) */
+    return; /* No match: do nothing */
   }
 
   qsort(cur->comp_matches, (size_t)cur->comp_count,
         sizeof(cur->comp_matches[0]), cmp_str_ptr);
 
   if (cur->comp_count == 1) {
-    /* One match: complete it. The rest of the line stays as typed (Slide 31) */
+    /* One match: complete it. The rest of the line stays as typed */
     replace_input_range(cur, replace_start, cur->input_pos,
                         cur->comp_matches[0]);
     return;

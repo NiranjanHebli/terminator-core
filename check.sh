@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sample script matching Slide 30 of Terminator-slides.pdf
+# Sample test script for native shell scripting engine
 # Demonstrates native script interpretation, positional arguments ($1),
 # nested if/else control flow, and [ -f ... ] test evaluations.
 

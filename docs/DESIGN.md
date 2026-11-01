@@ -2,9 +2,7 @@
 
 > **Course:** CS69201 · Computing Lab · Term Project  
 > **Institution:** Department of Computer Science and Engineering, Indian Institute of Technology Kharagpur  
-> **Target System:** `./terminator` (Thread Mode) | `./terminator useProcess=True` (Process Mode)  
-> **Author:** Niranjan Hebli (`niranjanhebli77@gmail.com`)  
-> **Reference:** [Terminator-slides.pdf](file:///Users/niranjan/Desktop/terminal_demo/assignment/Terminator-slides.pdf)
+> **Author:** Niranjan Hebli
 
 ---
 
@@ -27,26 +25,35 @@ Terminator unifies two system software components typically implemented as separ
 - **Terminal Emulator (GUI):** Connects to the X server, handles raw hardware input events, renders tab bars and in-memory text buffers, and drives the display.
 - **Command Shell Engine:** Lexically analyzes command strings, manages environment state, resolves paths, configures process hierarchies, wires I/O streams, and manages foreground/background jobs.
 
-```
-+-------------------------------------------------------------------------+
-|                              Terminator GUI                             |
-|  (X11 Event Loop, Window Manager, Tab Bar, In-Memory Text Buffers)     |
-+-------------------------------------------------------------------------+
-        |                                                 ^
-    Keystrokes                                      Stdout / Stderr
- (KeyPress Event)                                    (via Pipes)
-        v                                                 |
-+-------------------------------------------------------------------------+
-|                              Shell Engine                               |
-|   Parser  <--->  Built-in Commands  <--->  Job Table  <--->  History    |
-+-------------------------------------------------------------------------+
-        |                                                 ^
-    fork() / execvp()                              waitpid() / Signals
-        v                                                 |
-+-------------------------------------------------------------------------+
-|                              POSIX Kernel                               |
-|        (Processes, File Descriptors, Pipes, Process Groups, IPC)        |
-+-------------------------------------------------------------------------+
+```mermaid
+graph TD
+    UI_WIN["Window & Graphics Context"]
+    UI_TAB["Tab Bar & Navigation"]
+    UI_BUF["In-Memory Text Buffers"]
+
+    PARSER["Lexer & Parser"]
+    BUILTIN["Built-in Commands (cd, exit, jobs, ...)"]
+    JOBTAB["Job Control Table"]
+    HIST["Persistent History Ring"]
+
+    PROC["Processes & Process Groups"]
+    PIPES["Unix Pipes & File Descriptors"]
+    SIG["Signal Delivery Subsystem"]
+    SHM["POSIX Shared Memory & Semaphores"]
+
+    UI_WIN -- "KeyPress Events" --> PARSER
+    UI_BUF <-- "Stdout / Stderr via Pipes" -- BUILTIN
+    PARSER -- "fork() / execvp()" --> PROC
+    PARSER -- "pipe() / dup2()" --> PIPES
+    PROC -- "waitpid() / Signals" --> JOBTAB
+
+    classDef gui fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef shell fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef kernel fill:#7c2d12,stroke:#fb923c,stroke-width:2px,color:#ffffff;
+
+    class UI_WIN,UI_TAB,UI_BUF gui;
+    class PARSER,BUILTIN,JOBTAB,HIST shell;
+    class PROC,PIPES,SIG,SHM kernel;
 ```
 
 ### Core Invariant: Decoupled Shell Engine
@@ -67,7 +74,7 @@ Terminator functions as an X11 client communicating with an X server via the Xli
 - **Graphics Context (GC):** Configured with Catppuccin Mocha-inspired color palettes and monospace font structures (`XLoadQueryFont` with `9x15` fallback).
 
 ### 2.2 Unified Non-Blocking Event Multiplexing (`poll`)
-A central requirement from Slide 8 is: **"Sleep, don't spin. Never freeze the window."**
+A central design requirement is: **"Sleep, don't spin. Never freeze the window."**
 
 Terminator implements a non-blocking, multiplexed event loop driven by `poll()`:
 
@@ -92,28 +99,74 @@ int ret = poll(pfds, 1 + tab_count, timeout_ms);
 3. **Concurrent Background Tab Output:** When child tabs produce output (`pfds[1 + i]`), bytes are read in chunks (up to 4096 bytes) and appended to the respective tab's in-memory line buffer (`tab_append_text()`), even when that tab is hidden in the background.
 4. **Single-Threaded Xlib Invariant:** All Xlib calls are isolated strictly to the master GUI thread, preventing multi-threaded reentrancy collisions without requiring global display lock overhead.
 
+```mermaid
+flowchart TD
+    START(["poll() multiplexer"]) --> SLEEP["Sleep in kernel until activity"]
+    SLEEP --> CHECK{"What awakened poll()?"}
+    
+    CHECK -- "X11 Socket (ConnectionNumber)" --> XEVENTS["Drain pending X events (XPending)"]
+    XEVENTS --> EV_TYPE{"Event Type"}
+    EV_TYPE -- "KeyPress" --> KEY["Edit input line / Trigger hotkey"]
+    EV_TYPE -- "Expose / Configure" --> REDRAW["Calculate visible slice & redraw()"]
+    EV_TYPE -- "ButtonPress" --> TAB_SW["Switch tab / Create tab"]
+    KEY --> REDRAW
+    TAB_SW --> REDRAW
+
+    CHECK -- "Tab stdout/stderr pipe" --> READ_PIPE["Read up to 4KB chunk"]
+    READ_PIPE --> APPEND["tab_append_text() to tab line buffer"]
+    APPEND --> REDRAW
+
+    CHECK -- "Timeout" --> REDRAW
+    REDRAW --> SLEEP
+
+    classDef io fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef decision fill:#854d0e,stroke:#facc15,stroke-width:2px,color:#ffffff;
+    classDef action fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef render fill:#581c87,stroke:#c084fc,stroke-width:2px,color:#ffffff;
+
+    class START,SLEEP,READ_PIPE,APPEND io;
+    class CHECK,EV_TYPE decision;
+    class XEVENTS,KEY,TAB_SW action;
+    class REDRAW render;
+```
+
 ---
 
 ## 3. Concurrency Models & Shared State Synchronization
 
-Terminator supports two distinct execution models (Slide 18) that exhibit identical user-facing behavior.
+Terminator supports two distinct execution models that exhibit identical user-facing behavior.
 
-```
-       Thread Mode (Default)                    Process Mode (useProcess=True)
-       
-       +-----------------------+                +-----------------------+
-       |   Master GUI Process  |                |   Master GUI Process  |
-       |  +-----------------+  |                |   (X11 Loop & Tabs)   |
-       |  |  GUI Main Loop  |  |                +-----------------------+
-       |  +-----------------+  |                   |        |        |  (Pipes)
-       |  | Tab 1 (pthread) |  |                   v        v        v
-       |  | Tab 2 (pthread) |  |             +--------+ +--------+ +--------+
-       |  +-----------------+  |             | Tab 1  | | Tab 2  | | Tab 3  |
-       |     [Shared Heap]     |             | Process| | Process| | Process|
-       |  pthread_mutex_t lock |             +--------+ +--------+ +--------+
-       +-----------------------+                        |
-                                               [POSIX Shared Memory]
-                                               shm_open / mmap / sem_t
+```mermaid
+graph TD
+    TM_PROC["Thread Mode: Single Process"]
+    TM_GUI["Master GUI Thread (X11)"]
+    TM_T1["Tab 1 Worker (pthread)"]
+    TM_T2["Tab 2 Worker (pthread)"]
+    TM_MUTEX["Shared Heap & pthread_mutex_t"]
+    
+    TM_PROC --- TM_GUI
+    TM_PROC --- TM_T1
+    TM_PROC --- TM_T2
+    TM_T1 & TM_T2 <-->|"Mutex Lock"| TM_MUTEX
+
+    PM_GUI["Process Mode: Master GUI"]
+    PM_T1["Tab 1 Child Process (fork)"]
+    PM_T2["Tab 2 Child Process (fork)"]
+    PM_SHM["POSIX Shared Memory (shm_open / mmap)"]
+    PM_SEM["Named Semaphore (sem_open)"]
+    
+    PM_GUI -- "Pipes (in_fd / out_fd)" --> PM_T1
+    PM_GUI -- "Pipes (in_fd / out_fd)" --> PM_T2
+    PM_T1 & PM_T2 <-->|"sem_wait() / sem_post()"| PM_SEM
+    PM_T1 & PM_T2 <-->|"Direct Memory Mapping"| PM_SHM
+
+    classDef master fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef worker fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef sync fill:#854d0e,stroke:#facc15,stroke-width:2px,color:#ffffff;
+
+    class TM_PROC,TM_GUI,PM_GUI master;
+    class TM_T1,TM_T2,PM_T1,PM_T2 worker;
+    class TM_MUTEX,PM_SHM,PM_SEM sync;
 ```
 
 ### 3.1 Thread Mode (Default: `./terminator`)
@@ -161,6 +214,30 @@ Terminator supports two distinct execution models (Slide 18) that exhibit identi
    - Replaces the process image with `execvp(argv[0], argv)`. If `execvp()` returns, the child immediately calls `_exit(127)`.
 3. **Parent Reaping:** The parent shell waits using `waitpid(pid, &status, WUNTRACED)` and records the exit status in `$?`.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User / GUI
+    participant Shell as Parent Shell
+    participant Child as Child Process
+    participant Target as External Binary (e.g. ls)
+
+    User->>Shell: Submits command
+    Shell->>Child: fork()
+    Note over Child: child_setup()
+    Child->>Child: chdir(tab_cwd)
+    Child->>Child: dup2() redirections
+    Child->>Child: Reset signals (SIG_DFL)
+    Child->>Target: execvp(argv[0], argv)
+    activate Target
+    Target-->>Shell: Streams output through pipe
+    Target->>Child: Terminate with exit code
+    deactivate Target
+    Shell->>Shell: waitpid(pid, &status, WUNTRACED)
+    Note over Shell: Record status in $?
+    Shell->>User: Display next prompt
+```
+
 ### 4.2 I/O Redirection Engine
 Redirection operators (`<`, `>`, `>>`) are resolved before execution in the forked child process only:
 - `< file`: Opens target with `O_RDONLY` and invokes `dup2(fd, STDIN_FILENO)`.
@@ -179,6 +256,28 @@ For a pipeline of $N$ commands:
 4. **File Descriptor Cleanup Invariant:** Crucially, both the children and the parent close all unused pipe ends. If a single write end remains unclosed in the parent, the downstream reader will never observe EOF, deadlocking the pipeline.
 5. **Reaping & Status Tracking:** The parent waits for all $N$ processes; the return code of the last command (Stage $N-1$) becomes the exit status `$?` of the pipeline.
 
+```mermaid
+graph LR
+    CMD1["Stage 1: cmd1"]
+    CMD2["Stage 2: cmd2"]
+    CMD3["Stage 3: cmd3"]
+
+    STDIN["stdin"] -->|fd 0| CMD1
+    CMD1 -->|fd 1| PIPE1["Pipe 1"]
+    PIPE1 -->|fd 0| CMD2
+    CMD2 -->|fd 1| PIPE2["Pipe 2"]
+    PIPE2 -->|fd 0| CMD3
+    CMD3 -->|fd 1| STDOUT["stdout / file"]
+
+    classDef io fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef cmd fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef pipe fill:#854d0e,stroke:#facc15,stroke-width:2px,color:#ffffff;
+
+    class STDIN,STDOUT io;
+    class CMD1,CMD2,CMD3 cmd;
+    class PIPE1,PIPE2 pipe;
+```
+
 ### 4.4 Parallel Multi-Command Monitor (`multiWatch`)
 The `multiWatch ["cmd1", "cmd2", ...]` built-in runs multiple shell commands in parallel:
 - Creates an independent pipe pair for each command.
@@ -192,6 +291,40 @@ The `multiWatch ["cmd1", "cmd2", ...]` built-in runs multiple shell commands in 
   ```
 - When `Ctrl+C` is pressed, the shell issues `SIGKILL`/`SIGINT` to all child process groups and cleanly returns to the prompt.
 
+```mermaid
+flowchart TD
+    MW["multiWatch ['cmd1', 'cmd2', 'cmd3']"] --> FORK["Fork N Concurrent Workers"]
+    
+    FORK --> C1["Worker 1: cmd1"]
+    FORK --> C2["Worker 2: cmd2"]
+    FORK --> C3["Worker 3: cmd3"]
+    
+    C1 -->|"Pipe 1 stdout"| PFD1["pollfd[0]"]
+    C2 -->|"Pipe 2 stdout"| PFD2["pollfd[1]"]
+    C3 -->|"Pipe 3 stdout"| PFD3["pollfd[2]"]
+    
+    PFD1 & PFD2 & PFD3 --> POLL["Dedicated poll() Loop"]
+    
+    POLL --> ARRV{"Activity on Pipe i?"}
+    ARRV -- "Yes" --> FMT["Format Header with Timestamp & Command\nAppend chunk output to tab buffer"]
+    FMT --> OUT["Flush to Screen via redraw()"]
+    OUT --> POLL
+    
+    SIGINT["Ctrl+C (SIGINT)"] -.->|"Broadcast kill(-pgid, SIGINT)"| C1 & C2 & C3
+
+    classDef controller fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef worker fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef mux fill:#854d0e,stroke:#facc15,stroke-width:2px,color:#ffffff;
+    classDef signal fill:#991b1b,stroke:#f87171,stroke-width:2px,color:#ffffff;
+    classDef render fill:#581c87,stroke:#c084fc,stroke-width:2px,color:#ffffff;
+
+    class MW,FORK controller;
+    class C1,C2,C3 worker;
+    class PFD1,PFD2,PFD3,POLL,ARRV mux;
+    class SIGINT signal;
+    class FMT,OUT render;
+```
+
 ---
 
 ## 5. Signal Handling & Job Control Without a TTY
@@ -199,24 +332,34 @@ The `multiWatch ["cmd1", "cmd2", ...]` built-in runs multiple shell commands in 
 ### 5.1 Signal Routing Without a Kernel TTY
 In standard terminal emulators, the Linux kernel TTY line discipline automatically converts keystrokes like `\003` into `SIGINT` signals for the foreground process group. In Terminator, there is no pseudo-terminal (PTY) layer; the GUI receives raw X11 `KeyPress` events.
 
-```
-[User presses Ctrl+C]
-        |
-        v
-[X11 KeyPress Event (ControlMask + 'c')]
-        |
-        v
-[GUI inspects active tab slot]
-        |
-        +---> If active tab is busy:
-        |        fg_pgid = atomic_load(shared_state->fg_pgid[slot])
-        |        kill(-fg_pgid, SIGINT)   // Direct process group signal
-        |        echo "^C\n" to tab buffer
-        |
-        +---> If active tab is idle:
-                 Signal drop: echo "^C\n"
-                 Record last_interrupted = 1
-                 Clear typed input buffer
+```mermaid
+flowchart TD
+    KEY["User presses Ctrl+C"] --> EV["X11 KeyPress Event (ControlMask + 'c')"]
+    EV --> CHECK{"Is active tab busy?"}
+
+    CHECK -- "Yes (Command running)" --> FETCH["atomic_load(shared_state->fg_pgid[slot])"]
+    FETCH --> VALID{"Valid PGID? (pgid > 0 && pgid != GUI_PID)"}
+    VALID -- "Yes" --> KILL["kill(-fg_pgid, SIGINT)"]
+    KILL --> ECHO_RUN["Append '^C\n' to tab buffer"]
+    ECHO_RUN --> SET_INT["Set last_interrupted = 1 & record time"]
+    
+    CHECK -- "No (Idle at prompt)" --> ECHO_IDLE["Append 'user@terminator> ^C\n' to buffer"]
+    ECHO_IDLE --> CLEAR["Clear typed input & pending state"]
+    CLEAR --> SET_INT
+    
+    SET_INT --> REDRAW["redraw() next prompt with 'INT' in red"]
+
+    classDef input fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef check fill:#854d0e,stroke:#facc15,stroke-width:2px,color:#ffffff;
+    classDef signal fill:#991b1b,stroke:#f87171,stroke-width:2px,color:#ffffff;
+    classDef buffer fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef render fill:#581c87,stroke:#c084fc,stroke-width:2px,color:#ffffff;
+
+    class KEY,EV,FETCH input;
+    class CHECK,VALID check;
+    class KILL signal;
+    class ECHO_RUN,ECHO_IDLE,CLEAR,SET_INT buffer;
+    class REDRAW render;
 ```
 
 ### 5.2 Foreground Group Tracking
@@ -227,17 +370,20 @@ To safely deliver signals without race conditions:
 
 ### 5.3 Job State Transitions & Table
 
-```
-           cmd &
-      +-------------> [ BACKGROUND ] <----+
-      |                      |            |
-      |                      | fg %n      | bg %n
-      |                      v            |
-[ START ]                 [ FOREGROUND ]  |
-      |                      |            |
-      |                      | Ctrl+Z     |
-      |                      v            |
-      +-------------> [  STOPPED   ] -----+
+```mermaid
+stateDiagram-v2
+    [*] --> FOREGROUND: Interactive execution (cmd)
+    [*] --> BACKGROUND: Asynchronous execution (cmd &)
+
+    FOREGROUND --> STOPPED: Ctrl+Z (SIGTSTP)
+    STOPPED --> BACKGROUND: bg %n (SIGCONT)
+    STOPPED --> FOREGROUND: fg %n (SIGCONT)
+    BACKGROUND --> FOREGROUND: fg %n
+
+    FOREGROUND --> TERMINATED: Process completes (exit / EOF)
+    FOREGROUND --> TERMINATED: Ctrl+C (SIGINT)
+    BACKGROUND --> TERMINATED: Background process exits
+    TERMINATED --> [*]
 ```
 
 - **`Ctrl+Z` (`SIGTSTP`):** Sent to the foreground group `-pgid`. `waitpid(-pgid, &status, WUNTRACED)` detects the stop. The process group is registered in the tab's `Job` table, and `[1]+ Stopped <cmd>` is printed.
@@ -310,6 +456,61 @@ typedef struct {
 } Tab;
 ```
 
+### 6.3 Data Structure Relationships & Memory Layout
+
+```mermaid
+classDiagram
+    class SharedState {
+        +pthread_mutex_t shared_mutex
+        +char clipboard
+        +char history
+        +int history_count
+        +int history_head
+        +_Atomic int fg_pgid
+        +_Atomic int busy
+        +_Atomic long last_duration_ms
+        +_Atomic int last_status
+        +_Atomic int last_interrupted
+        +char last_time
+    }
+
+    class Tab {
+        +int id
+        +pid_t pid
+        +int in_fd
+        +int out_fd
+        +char title
+        +char cwd
+        +char input
+        +char pending
+        +char lines
+        +int line_count
+        +Job jobs
+        +int job_count
+    }
+
+    class Job {
+        +int id
+        +pid_t pgid
+        +char command
+        +int state
+    }
+
+    class TerminatorGUI {
+        +Display* dpy
+        +Window win
+        +GC gc
+        +Tab tabs
+        +int active_tab
+        +int tab_count
+        +SharedState* shared_state
+    }
+
+    TerminatorGUI "1" *-- "1..MAX_TABS" Tab : manages
+    TerminatorGUI "1" o-- "1" SharedState : synchronizes via
+    Tab "1" *-- "0..MAX_JOBS" Job : tracks
+```
+
 ---
 
 ## 7. Bash-Style Subsystems
@@ -321,6 +522,30 @@ typedef struct {
   - `\`: Escapes the subsequent character.
 - **Multiline Input (`input_status`):** If an input buffer contains an open quote, a trailing backslash, or an open `$(`, the shell and GUI present the continuation prompt `> ` and accumulate lines until syntax is complete.
 - **Command Substitution (`$(cmd)`):** Evaluated recursively from innermost to outermost. Spawns an internal subshell pipe, captures stdout into an in-memory buffer, strips trailing newlines, and splices the text into the command string.
+
+```mermaid
+flowchart TD
+    RAW["Raw Input String"] --> CONT{"Complete Syntax?\n(Unmatched quotes, trailing backslash, open subshell)"}
+    CONT -- "No" --> MULTI["Emit multiline prompt '> '\nAccumulate line in pending buffer"]
+    MULTI --> RAW
+    
+    CONT -- "Yes" --> SUB["Command Substitution Engine\nEvaluate $(cmd) recursively"]
+    SUB --> EXP["Variable Expansion Subsystem\nExpand $VAR, ${VAR}, $?, $$"]
+    EXP --> LEX["Tokenization & Quote Stripping\nPreserve quoted argument boundaries"]
+    LEX --> REDIR["Parse Redirections (<, >, >>)"]
+    REDIR --> PIPE["Split Pipeline Stages (|)"]
+    PIPE --> EXEC["Dispatch to Shell Execution Engine"]
+
+    classDef input fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef check fill:#854d0e,stroke:#facc15,stroke-width:2px,color:#ffffff;
+    classDef transform fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef exec fill:#7c2d12,stroke:#fb923c,stroke-width:2px,color:#ffffff;
+
+    class RAW,MULTI input;
+    class CONT check;
+    class SUB,EXP,LEX,REDIR,PIPE transform;
+    class EXEC exec;
+```
 
 ### 7.2 Keybinding Engine & `~/.terminatorrc`
 Default bindings conform to standard readline:
@@ -348,12 +573,71 @@ Pressing `Tab` tokenizes the word before the cursor:
 2. **Multiple Matches:** Expands input to the Longest Common Prefix (LCP), then prints a numbered candidate list (`1. fileA  2. fileB`) and awaits a numeric key selection (`1`..`9`).
 3. **No Match:** Audio/visual pass-through; leaves input unchanged.
 
+```mermaid
+flowchart TD
+    TAB["User presses Tab"] --> TOKEN["Extract current token before cursor"]
+    TOKEN --> SCAN["opendir(cwd) & readdir()\nCollect prefix matches"]
+    SCAN --> COUNT{"Match Count"}
+
+    COUNT -- "0 Matches" --> BEEP["No matches: Pass through / No-op"]
+    
+    COUNT -- "1 Match" --> EXPAND["Inline Expansion:\nComplete word directly in input line"]
+    
+    COUNT -- "> 1 Matches" --> LCP["Compute Longest Common Prefix (LCP)"]
+    LCP --> EXP_LCP["Expand input line to LCP"]
+    EXP_LCP --> MENU["Print numbered candidates to buffer:\n1. file_a  2. file_b  3. file_c"]
+    MENU --> WAIT["Enter completing state (await digit 1..9)"]
+    WAIT --> KEY{"Key pressed"}
+    KEY -- "Digit '1'..'9'" --> SELECT["Complete with selected match"]
+    KEY -- "Other key" --> CANCEL["Cancel completion & process key"]
+
+    classDef trigger fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef branch fill:#854d0e,stroke:#facc15,stroke-width:2px,color:#ffffff;
+    classDef success fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef cancel fill:#991b1b,stroke:#f87171,stroke-width:2px,color:#ffffff;
+    classDef interactive fill:#581c87,stroke:#c084fc,stroke-width:2px,color:#ffffff;
+
+    class TAB,TOKEN,SCAN trigger;
+    class COUNT,KEY branch;
+    class EXPAND,SELECT success;
+    class BEEP,CANCEL cancel;
+    class LCP,EXP_LCP,MENU,WAIT interactive;
+```
+
 ### 7.5 Native Shell Scripting Engine
 Terminator executes scripts (`./check.sh`, `bash check.sh`, `source check.sh`) natively without delegating to `/bin/bash`:
 - **Variables & Positional Parameters:** Handles assignment (`VAR=value`), positional parameters (`$1`..`$9`), argument count (`$#`), and status (`$?`).
 - **Control Flow:** Nested `if` / `elif` / `else` / `fi` blocks.
 - **`[` Test Expressions:** Evaluates file tests (`-f`, `-d`, `-e`), string tests (`=`, `!=`, `-z`, `-n`), and arithmetic comparisons (`-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`).
 - **Non-Fatal Script Termination:** An `exit n` inside a script terminates script interpretation with code `n` while keeping the parent terminal tab active.
+
+```mermaid
+flowchart TD
+    SCRIPT["Execute Script: ./check.sh / source / bash"] --> READ["Read script file line by line"]
+    READ --> STRIP["Strip comments (#) & trim whitespace"]
+    STRIP --> PARSE{"Statement Type"}
+    
+    PARSE -- "Variable Assignment" --> SETENV["Store variable in local environment"]
+    PARSE -- "if [ condition ]" --> EVAL_COND["Evaluate test expression [ ... ]"]
+    EVAL_COND --> BRANCH{"Condition True?"}
+    BRANCH -- "Yes" --> EXEC_THEN["Execute 'then' block statements"]
+    BRANCH -- "No" --> EXEC_ELSE["Execute 'elif' / 'else' block statements"]
+    
+    PARSE -- "exit [code]" --> EXIT_SCRIPT["Set $? = code & Terminate script\n(Parent shell tab remains active)"]
+    PARSE -- "External / Builtin Command" --> EXEC_CMD["Execute command via Shell Engine"]
+    
+    EXEC_THEN & EXEC_ELSE & SETENV & EXEC_CMD --> NEXT["Fetch next statement until 'fi' or EOF"]
+
+    classDef io fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef branch fill:#854d0e,stroke:#facc15,stroke-width:2px,color:#ffffff;
+    classDef exec fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef exit fill:#991b1b,stroke:#f87171,stroke-width:2px,color:#ffffff;
+
+    class SCRIPT,READ,STRIP,NEXT io;
+    class PARSE,BRANCH,EVAL_COND branch;
+    class SETENV,EXEC_THEN,EXEC_ELSE,EXEC_CMD exec;
+    class EXIT_SCRIPT exit;
+```
 
 ---
 
@@ -366,12 +650,61 @@ To provide rich terminal aesthetics, Terminator features a modern two-pill statu
 - **Right Pill:** Background `#242535`. Displays command timing (`took 1s` via monotonic clock `clock_gettime(CLOCK_MONOTONIC)`), interrupt flags (`INT` in red `#f38ba8`), non-zero error codes (`ERR <status>`), and completion timestamp (`at 06:38:29 PM`) in teal `#94e2d5`.
 - **Input Prompt:** Clean prompt rendered immediately below as `user@terminator> `.
 
+```mermaid
+graph LR
+    P1["Directory (~/path)\nColor: #89b4fa (Blue)"]
+    P2["Git Branch (| on main)\nColor: #a6e3a1 (Green)"]
+    DASH["Connector Dashes (------)\nColor: #6c7086 (Muted)"]
+    P3["Duration (took 1s)\nColor: #f9e2af (Yellow)"]
+    P4["Status (INT / ERR)\nColor: #f38ba8 (Red)"]
+    P5["Time (at 12:00 PM)\nColor: #94e2d5 (Teal)"]
+    PROMPT["Clean Input Line: user@terminator> █"]
+
+    P1 --- P2 --- DASH --- P3 --- P4 --- P5
+    DASH --> PROMPT
+
+    classDef bluePill fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
+    classDef greenPill fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
+    classDef yellowPill fill:#854d0e,stroke:#facc15,stroke-width:2px,color:#ffffff;
+    classDef redPill fill:#991b1b,stroke:#f87171,stroke-width:2px,color:#ffffff;
+    classDef tealPill fill:#115e59,stroke:#2dd4bf,stroke-width:2px,color:#ffffff;
+    classDef spacer fill:#374151,stroke:#9ca3af,stroke-width:1px,color:#ffffff;
+    classDef prompt fill:#581c87,stroke:#c084fc,stroke-width:2px,color:#ffffff;
+
+    class P1 bluePill;
+    class P2 greenPill;
+    class P3 yellowPill;
+    class P4 redPill;
+    class P5 tealPill;
+    class DASH spacer;
+    class PROMPT prompt;
+```
+
 ### 8.2 Scrollback History Persistence
 To prevent status information from disappearing once a command finishes:
 - Status bars are committed directly into the tab's historical line buffer (`cur->lines`) when a command is submitted on `XK_Return` or interrupted on `Ctrl+C`.
 - The line is stored using an internal marker format:
   `\001[BAR]\001<cwd>\t<branch>\t<dur_str>\t<time_str>\t<right_is_err>`
 - When `redraw()` renders the visible line slice (`start_line` to `line_count`), it parses bar lines and invokes `draw_status_bar()`, ensuring historical status bars remain permanently visible in scrollback history with identical Catppuccin pill geometry and colors.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User
+    participant Buffer as Tab Line Buffer (cur->lines)
+    participant Display as X11 Display
+    participant Shell as Shell Engine
+
+    Note over Display: Active prompt: [~/path | on main --- took 1s | at 12:00]\nuser@terminator> █
+    User->>Display: Types "ls" and presses Enter (XK_Return)
+    Display->>Buffer: append_status_bar_line(cur)
+    Display->>Buffer: append "user@terminator> ls\n"
+    Display->>Shell: write(in_fd, "ls\n")
+    Shell->>Shell: Execute command (fork + execvp)
+    Shell->>Buffer: Streams output ("Makefile", "README.md", ...)
+    Shell->>Shell: Command finishes -> monotonic clock computes elapsed_ms
+    Note over Display: redraw() renders:\n1. All historical lines in buffer (including previous status bars)\n2. New active status bar [~/path | on main --- took 8ms | at 12:00]\n3. New prompt: user@terminator> █
+```
 
 ---
 

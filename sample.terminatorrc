@@ -1,5 +1,5 @@
 # ~/.terminatorrc - Sample Custom Keybinding Configuration
-# Slide 27: Hotkeys: bash defaults, user's choice
+# Hotkeys: bash defaults, user's choice
 # Copy this file to ~/.terminatorrc to apply custom keybindings:
 #   cp sample.terminatorrc ~/.terminatorrc
 
