@@ -42,7 +42,83 @@ make clean
 
 ---
 
-## Features
+## Documentation
+
+- **System Design Document:** Detailed architecture, concurrency models, synchronization, data structures, IPC, and signals: [docs/DESIGN.md](docs/DESIGN.md).
+- **Comprehensive Demo Guide:** Complete step-by-step walkthrough of all features: [assignment/demo.txt](assignment/demo.txt).
+- **Slide Reference Specifications:** Course assignment reference: [assignment/REQUIREMENTS_ACT_1_TO_5.md](assignment/REQUIREMENTS_ACT_1_TO_5.md).
+
+---
+
+## Quick Start & Running Terminator
+
+Terminator provides two execution architectures presenting identical behaviors:
+
+```bash
+./terminator                     # Thread mode (default, one process with POSIX worker threads)
+./terminator useProcess=True     # Process mode (multi-process with forked child tabs)
+./terminator --shell             # Headless test mode (runs shell engine on stdin/stdout, no X11)
+```
+
+---
+
+## Quick Demo Commands
+
+### 1. Test Script Execution (Slide 30)
+Run the bundled test script [check.sh](check.sh) natively inside Terminator:
+```bash
+./check.sh terminal.c            # Tests [ -f ] true branch: compiles myprog
+./check.sh missing_file.c        # Tests [ -f ] false branch: reports missing file
+```
+
+### 2. Multi-Stage Pipelines & Redirection
+```bash
+ls -la | grep "terminal" > out.txt
+cat < out.txt | wc -l
+echo "Files in $(basename $(pwd)): $(ls | wc -l)"
+```
+
+### 3. Parallel Live Command Monitor (`multiWatch`)
+```bash
+multiWatch ["date +%T", "ls | wc -l"]
+# Press Ctrl+C to stop all parallel jobs and return cleanly to prompt
+```
+
+### 4. No-TTY Signal Delivery & Job Control
+```bash
+sleep 100 &                      # Starts in background: prints [1] <pid>
+jobs                             # Lists running and stopped jobs
+fg %1                            # Brings job 1 to foreground
+# Press Ctrl+Z to stop foreground job: prints [1]+ Stopped sleep 100
+bg %1                            # Resumes job in background: prints [1]+ sleep 100 &
+# Press Ctrl+C to interrupt active foreground job
+```
+
+### 5. Interactive Reverse History Search (`Ctrl+R`)
+Press `Ctrl+R` to prompt:
+```text
+Enter search term: sleep
+```
+Returns the most recent match, longest common substring (>2 characters), or `No match for search term in history`.
+
+### 6. Tab Filename Auto-Completion
+Type a prefix and press `Tab`:
+```text
+./check.sh ter[Tab]              # Expands to ./check.sh terminal.c
+```
+If multiple candidates match, extends to Longest Common Prefix (LCP) and presents a numbered list:
+```text
+1. terminal.c   2. terminator
+# Press 1 or 2 to select
+```
+
+### 7. Custom Keybindings (`~/.terminatorrc`)
+Custom keybindings can be loaded without recompilation:
+```bash
+cp sample.terminatorrc ~/.terminatorrc
+```
+
+---
 
 ### X11 GUI & Multi-Tab Terminal Foundation
 - Custom X11 window rendered via Xlib with modern Catppuccin Mocha-inspired color scheme.
@@ -165,13 +241,4 @@ bind delete-word Alt+Backspace
 - **Variables & parameters:** supports variable assignment (`VAR=val`), expansion (`$VAR`, `${VAR}`), positional arguments (`$1`..`$9`, `$#`, `$0`), and command status (`$?`).
 - **Conditional execution:** nested `if / elif / else / fi` blocks with built-in `[` test supporting file checks (`-f`, `-d`, `-e`), string comparisons (`=`, `!=`, `-z`, `-n`), and integer comparisons (`-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`).
 - **Non-fatal script exit:** `exit n` inside a script terminates only the script execution with status `n` without closing the tab or shell session.
-
----
-
-## Run
-
-```bash
-./terminator                     # thread mode (default)
-./terminator useProcess=True     # process mode
-```
 

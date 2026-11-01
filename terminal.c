@@ -1459,6 +1459,12 @@ static size_t next_statement(const char *s, size_t pos, char **out_stmt,
           *out_op = OP_OR;
         return pos + 2;
       }
+    } else {
+      if (s[pos] == '\n' || s[pos] == ';') {
+        at_start = 1;
+        pos++;
+        continue;
+      }
     }
     size_t wstart = pos;
     while (s[pos] && s[pos] != ' ' && s[pos] != '\t' && s[pos] != '\n' &&

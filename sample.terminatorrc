@@ -1,0 +1,22 @@
+# ~/.terminatorrc - Sample Custom Keybinding Configuration
+# Slide 27: Hotkeys: bash defaults, user's choice
+# Copy this file to ~/.terminatorrc to apply custom keybindings:
+#   cp sample.terminatorrc ~/.terminatorrc
+
+# Custom keybindings survive application restarts and reconfigure keys without recompilation.
+# Syntax: bind <action-name> <key-combo>
+
+# Actions supported:
+#   clear-screen    (default: Ctrl+L)
+#   delete-word     (default: Ctrl+W)
+#   cursor-start    (default: Ctrl+A)
+#   cursor-end      (default: Ctrl+E)
+#   delete-to-start (default: Ctrl+U)
+#   delete-to-end   (default: Ctrl+K)
+#   copy            (default: Ctrl+Shift+C)
+#   paste           (default: Ctrl+Shift+V)
+#   new-tab         (default: Ctrl+T)
+#   close-tab       (default: Ctrl+D)
+
+bind clear-screen Ctrl+Shift+L
+bind delete-word Alt+Backspace
