@@ -240,3 +240,7 @@ bind delete-word Alt+Backspace
 - **Conditional execution:** nested `if / elif / else / fi` blocks with built-in `[` test supporting file checks (`-f`, `-d`, `-e`), string comparisons (`=`, `!=`, `-z`, `-n`), and integer comparisons (`-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`).
 - **Non-fatal script exit:** `exit n` inside a script terminates only the script execution with status `n` without closing the tab or shell session.
 
+#### Command & Subcommand "Did You Mean?" Suggestions
+- **Fuzzy command matching:** Uses Damerau-Levenshtein edit distance to suggest matching built-ins or executables in `$PATH` when a command is not found (e.g., `sl` suggests `ls`).
+- **Subcommand matching for popular CLIs:** If commands like `git`, `docker`, `apt`, `npm`, or `cargo` fail due to a typo in the subcommand (e.g., `git cmmit`), Terminator suggests the intended subcommand (`Did you mean 'git commit'?`).
+

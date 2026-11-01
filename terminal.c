@@ -1802,6 +1802,181 @@ static int execute_if_block(const char *stmt) {
   return last_status;
 }
 
+/* ---- Command & Subcommand "Did you mean?" Typo Suggestion Engine ---- */
+static int levenshtein_dist(const char *s1, const char *s2) {
+  size_t l1 = strlen(s1), l2 = strlen(s2);
+  if (l1 > 64 || l2 > 64)
+    return 99;
+  int dp[65][65];
+  for (size_t i = 0; i <= l1; i++)
+    dp[i][0] = (int)i;
+  for (size_t j = 0; j <= l2; j++)
+    dp[0][j] = (int)j;
+  for (size_t i = 1; i <= l1; i++) {
+    for (size_t j = 1; j <= l2; j++) {
+      int cost = (tolower((unsigned char)s1[i - 1]) ==
+                  tolower((unsigned char)s2[j - 1]))
+                     ? 0
+                     : 1;
+      int del = dp[i - 1][j] + 1;
+      int ins = dp[i][j - 1] + 1;
+      int sub = dp[i - 1][j - 1] + cost;
+      int m = del < ins ? del : ins;
+      dp[i][j] = m < sub ? m : sub;
+      if (i > 1 && j > 1 &&
+          tolower((unsigned char)s1[i - 1]) ==
+              tolower((unsigned char)s2[j - 2]) &&
+          tolower((unsigned char)s1[i - 2]) ==
+              tolower((unsigned char)s2[j - 1])) {
+        int tr = dp[i - 2][j - 2] + 1;
+        if (tr < dp[i][j])
+          dp[i][j] = tr;
+      }
+    }
+  }
+  return dp[l1][l2];
+}
+
+static void suggest_similar_command(const char *bad_cmd, char *best_match,
+                                    size_t cap) {
+  best_match[0] = '\0';
+  if (!bad_cmd || !*bad_cmd || strchr(bad_cmd, '/'))
+    return;
+
+  static const char *const builtins[] = {
+      "cd",      "exit",   "source", "export",     "history", "jobs",
+      "fg",      "bg",     "test",   "multiWatch", "bash",    "sh",
+      "if",      "then",   "elif",   "else",       "fi",      NULL};
+
+  int best_d = 3; /* suggest only when edit distance <= 2 */
+  size_t blen = strlen(bad_cmd);
+  if (blen <= 2)
+    best_d = 1;
+
+  for (int i = 0; builtins[i]; i++) {
+    int d = levenshtein_dist(bad_cmd, builtins[i]);
+    if (d > 0 && d <= best_d) {
+      best_d = d - 1;
+      snprintf(best_match, cap, "%s", builtins[i]);
+    }
+  }
+
+  const char *path_env = getenv("PATH");
+  if (!path_env)
+    return;
+  char *paths = strdup(path_env);
+  if (!paths)
+    return;
+
+  char *saveptr = NULL;
+  for (char *dir = strtok_r(paths, ":", &saveptr); dir;
+       dir = strtok_r(NULL, ":", &saveptr)) {
+    DIR *d = opendir(dir);
+    if (!d)
+      continue;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+      if (de->d_name[0] == '.')
+        continue;
+      size_t nlen = strlen(de->d_name);
+      if (nlen + 2 < blen || nlen > blen + 2)
+        continue;
+      int dist = levenshtein_dist(bad_cmd, de->d_name);
+      if (dist > 0 && dist <= best_d) {
+        char full[PATH_MAX];
+        snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+        if (access(full, X_OK) == 0) {
+          best_d = dist - 1;
+          snprintf(best_match, cap, "%s", de->d_name);
+        }
+      }
+    }
+    closedir(d);
+  }
+  free(paths);
+}
+
+static void check_subcommand_suggestion(int argc, char **argv, int status) {
+  if (status == 0 || argc < 2 || argv[1][0] == '-')
+    return;
+
+  static const char *const git_subs[] = {
+      "add",      "bisect",     "branch",   "checkout", "cherry-pick",
+      "clean",    "clone",      "commit",   "config",   "diff",
+      "fetch",    "grep",       "init",     "log",      "merge",
+      "mv",       "pull",       "push",     "rebase",   "remote",
+      "reset",    "restore",    "revert",   "rm",       "show",
+      "stash",    "status",     "submodule","switch",   "tag",
+      "worktree", NULL};
+
+  static const char *const docker_subs[] = {
+      "build", "commit",  "compose", "container", "cp",     "create",
+      "diff",  "events",  "exec",    "export",    "history", "image",
+      "images","import",  "info",    "inspect",   "kill",   "load",
+      "login", "logout",  "logs",    "network",   "node",   "pause",
+      "port",  "ps",      "pull",    "push",      "rename", "restart",
+      "rm",    "rmi",     "run",     "save",      "search", "service",
+      "start", "stats",   "stop",    "swarm",     "system", "tag",
+      "top",   "unpause", "update",  "version",   "volume", "wait",
+      NULL};
+
+  static const char *const apt_subs[] = {
+      "install",      "remove",  "purge",      "update",   "upgrade",
+      "full-upgrade", "search",  "show",       "list",     "autoremove",
+      "clean",        "depends", "rdepends",   "policy",   "source",
+      NULL};
+
+  static const char *const npm_subs[] = {
+      "install", "uninstall", "update", "run",     "start", "test",
+      "build",   "init",      "publish","audit",   "ci",    "cache",
+      "config",  "exec",      "list",   "outdated","pack",  "version",
+      NULL};
+
+  static const char *const cargo_subs[] = {
+      "build", "check", "clean", "doc",     "new",    "init",
+      "add",   "remove","run",   "test",    "bench",  "update",
+      "search","publish","install","uninstall","clippy","fmt",
+      NULL};
+
+  const char *cmd = strrchr(argv[0], '/');
+  cmd = cmd ? cmd + 1 : argv[0];
+
+  const char *const *list = NULL;
+  if (strcmp(cmd, "git") == 0)
+    list = git_subs;
+  else if (strcmp(cmd, "docker") == 0 || strcmp(cmd, "podman") == 0)
+    list = docker_subs;
+  else if (strcmp(cmd, "apt") == 0 || strcmp(cmd, "apt-get") == 0)
+    list = apt_subs;
+  else if (strcmp(cmd, "npm") == 0 || strcmp(cmd, "pnpm") == 0 ||
+           strcmp(cmd, "yarn") == 0)
+    list = npm_subs;
+  else if (strcmp(cmd, "cargo") == 0)
+    list = cargo_subs;
+
+  if (!list)
+    return;
+
+  for (int i = 0; list[i]; i++) {
+    if (strcmp(argv[1], list[i]) == 0)
+      return; /* valid subcommand failed for a normal runtime reason */
+  }
+
+  const char *best = NULL;
+  int best_d = 3;
+  for (int i = 0; list[i]; i++) {
+    int d = levenshtein_dist(argv[1], list[i]);
+    if (d > 0 && d <= best_d) {
+      best_d = d - 1;
+      best = list[i];
+    }
+  }
+  if (best) {
+    sh_err("terminator: '%s %s' failed. Did you mean '%s %s'?\n", cmd, argv[1],
+           cmd, best);
+  }
+}
+
 static int execute_single_line(const char *line);
 
 static int execute_script_text(const char *text) {
@@ -2126,7 +2301,9 @@ static int execute_single_line(const char *line) {
       return last_status;
     }
 
-    if ((strcmp(argv[0], "bash") == 0 || strcmp(argv[0], "sh") == 0) &&
+    const char *cmd_base = strrchr(argv[0], '/');
+    cmd_base = cmd_base ? cmd_base + 1 : argv[0];
+    if ((strcmp(cmd_base, "bash") == 0 || strcmp(cmd_base, "sh") == 0) &&
         argc >= 2) {
       last_status = run_script_file(argv[1], argc - 1, argv + 1, 0);
       tok_free(&tl);
@@ -2336,7 +2513,14 @@ static int execute_single_line(const char *line) {
       }
 
       execvp(stage_argv[s][0], stage_argv[s]);
-      sh_err("terminator: %s: command not found\n", stage_argv[s][0]);
+      char suggestion[128];
+      suggest_similar_command(stage_argv[s][0], suggestion, sizeof(suggestion));
+      if (suggestion[0]) {
+        sh_err("terminator: %s: command not found. Did you mean '%s'?\n",
+               stage_argv[s][0], suggestion);
+      } else {
+        sh_err("terminator: %s: command not found\n", stage_argv[s][0]);
+      }
       _exit(127);
     }
 
@@ -2370,6 +2554,10 @@ static int execute_single_line(const char *line) {
       last_status = 0;
     } else {
       wait_foreground(job, 0);
+      if (num_cmds == 1 && last_status != 0 && last_status != 127 &&
+          last_status != 130) {
+        check_subcommand_suggestion(stage_argc[0], stage_argv[0], last_status);
+      }
     }
     fflush(stdout);
     fflush(stderr);

@@ -639,6 +639,17 @@ flowchart TD
     class EXIT_SCRIPT exit;
 ```
 
+### 7.6 Command & Subcommand "Did You Mean?" Typo Suggestion Engine
+Terminator integrates a fuzzy typo suggestion subsystem based on the Damerau-Levenshtein distance metric (accounting for character insertion, deletion, substitution, and transposition):
+- **Command Typo Correction:** When a command fails with `_exit(127)` (`command not found`), the engine scans all built-in commands and executable binaries in `$PATH`. If a candidate within edit distance $\le 2$ ($\le 1$ for short tokens) is found, the shell prints:
+  ```text
+  terminator: sl: command not found. Did you mean 'ls'?
+  ```
+- **Subcommand Typo Correction:** If a supported multi-command CLI (`git`, `docker`, `podman`, `apt`, `npm`, `pnpm`, `yarn`, `cargo`) exits with a non-zero status due to an unrecognized subcommand, Terminator identifies the closest valid subcommand:
+  ```text
+  terminator: 'git cmmit' failed. Did you mean 'git commit'?
+  ```
+
 ---
 
 ## 8. Starship-Style Status Bar & Prompt Engine
