@@ -1376,9 +1376,14 @@ static int eval_bracket_test(int argc, char **argv) {
   return res;
 }
 
+enum { OP_SEMI = 0, OP_AND, OP_OR };
+
 /* Split script/command buffer into next logical statement (separated by
- * unquoted \n or ;) */
-static size_t next_statement(const char *s, size_t pos, char **out_stmt) {
+ * unquoted \n, ;, &&, or ||) */
+static size_t next_statement(const char *s, size_t pos, char **out_stmt,
+                             int *out_op) {
+  if (out_op)
+    *out_op = OP_SEMI;
   while (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == ';')
     pos++;
   if (!s[pos]) {
@@ -1399,8 +1404,8 @@ static size_t next_statement(const char *s, size_t pos, char **out_stmt) {
         pos++;
       continue;
     }
-    if (s[pos] == '\n' || s[pos] == ';') {
-      if (if_depth == 0) {
+    if (if_depth == 0) {
+      if (s[pos] == '\n' || s[pos] == ';') {
         size_t len = pos - start;
         char *r = malloc(len + 1);
         if (!r)
@@ -1408,15 +1413,40 @@ static size_t next_statement(const char *s, size_t pos, char **out_stmt) {
         memcpy(r, s + start, len);
         r[len] = '\0';
         *out_stmt = r;
+        if (out_op)
+          *out_op = OP_SEMI;
         return pos + 1;
       }
-      at_start = 1;
-      pos++;
-      continue;
+      if (s[pos] == '&' && s[pos + 1] == '&') {
+        size_t len = pos - start;
+        char *r = malloc(len + 1);
+        if (!r)
+          _exit(1);
+        memcpy(r, s + start, len);
+        r[len] = '\0';
+        *out_stmt = r;
+        if (out_op)
+          *out_op = OP_AND;
+        return pos + 2;
+      }
+      if (s[pos] == '|' && s[pos + 1] == '|') {
+        size_t len = pos - start;
+        char *r = malloc(len + 1);
+        if (!r)
+          _exit(1);
+        memcpy(r, s + start, len);
+        r[len] = '\0';
+        *out_stmt = r;
+        if (out_op)
+          *out_op = OP_OR;
+        return pos + 2;
+      }
     }
     size_t wstart = pos;
     while (s[pos] && s[pos] != ' ' && s[pos] != '\t' && s[pos] != '\n' &&
-           s[pos] != ';') {
+           s[pos] != ';' &&
+           !(if_depth == 0 && ((s[pos] == '&' && s[pos + 1] == '&') ||
+                               (s[pos] == '|' && s[pos + 1] == '|')))) {
       if (s[pos] == '\'') {
         pos++;
         while (s[pos] && s[pos] != '\'')
@@ -1464,6 +1494,8 @@ static size_t next_statement(const char *s, size_t pos, char **out_stmt) {
   memcpy(r, s + start, len);
   r[len] = '\0';
   *out_stmt = r;
+  if (out_op)
+    *out_op = OP_SEMI;
   return pos;
 }
 
@@ -1751,19 +1783,30 @@ static int execute_single_line(const char *line);
 static int execute_script_text(const char *text) {
   size_t pos = 0;
   char *stmt = NULL;
-  while (!shell_exit_requested && (pos = next_statement(text, pos, &stmt)) &&
-         stmt != NULL) {
+  int next_op = OP_SEMI;
+  int prev_op = OP_SEMI;
+  while (!shell_exit_requested &&
+         (pos = next_statement(text, pos, &stmt, &next_op)) && stmt != NULL) {
     const char *p = stmt;
     while (*p == ' ' || *p == '\t' || *p == '\n')
       p++;
     if (*p && *p != '#') {
-      if (strncmp(p, "if", 2) == 0 &&
-          (p[2] == ' ' || p[2] == '\t' || p[2] == '\n')) {
-        last_status = execute_if_block(p);
-      } else {
-        last_status = execute_single_line(p);
+      int skip = 0;
+      if (prev_op == OP_AND && last_status != 0)
+        skip = 1;
+      else if (prev_op == OP_OR && last_status == 0)
+        skip = 1;
+
+      if (!skip) {
+        if (strncmp(p, "if", 2) == 0 &&
+            (p[2] == ' ' || p[2] == '\t' || p[2] == '\n')) {
+          last_status = execute_if_block(p);
+        } else {
+          last_status = execute_single_line(p);
+        }
       }
     }
+    prev_op = next_op;
     free(stmt);
     stmt = NULL;
   }
