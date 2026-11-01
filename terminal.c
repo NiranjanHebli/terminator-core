@@ -1917,7 +1917,7 @@ static int execute_single_line(const char *line) {
   const char *mw = line;
   while (*mw == ' ' || *mw == '\t')
     mw++;
-  if (strncmp(mw, "multiWatch", 10) == 0 &&
+  if (strncasecmp(mw, "multiwatch", 10) == 0 &&
       (mw[10] == '\0' || mw[10] == ' ' || mw[10] == '\t' || mw[10] == '[')) {
     last_status = multi_watch(mw + 10);
     return last_status;
@@ -2379,46 +2379,61 @@ static int parse_multiwatch(const char *s, char *cmds[], int *n) {
   *n = 0;
   while (isspace((unsigned char)*s))
     s++;
-  if (*s != '[')
-    return -1;
-  s++;
+  int has_bracket = 0;
+  if (*s == '[') {
+    has_bracket = 1;
+    s++;
+  }
   for (;;) {
     while (isspace((unsigned char)*s))
       s++;
-    if (*s == ']') {
+    if (!*s)
+      break;
+    if (has_bracket && *s == ']') {
       s++;
       break;
     }
-    if (*s != '"' && *s != '\'')
-      return -1;
-    char q = *s++;
-    Str w = {0};
-    while (*s && *s != q) {
-      if (q == '"' && *s == '\\' && (s[1] == '"' || s[1] == '\\'))
-        s++;
-      str_putc(&w, *s++);
-    }
-    if (*s != q || *n >= MULTIWATCH_MAX) {
-      free(w.data);
-      return -1;
-    }
-    s++;
-    cmds[(*n)++] = w.data ? w.data : empty_str();
-    while (isspace((unsigned char)*s))
-      s++;
     if (*s == ',') {
       s++;
       continue;
     }
-    if (*s == ']') {
-      s++;
-      break;
+    if (*s == '"' || *s == '\'') {
+      char q = *s++;
+      Str w = {0};
+      while (*s && *s != q) {
+        if (q == '"' && *s == '\\' && (s[1] == '"' || s[1] == '\\'))
+          s++;
+        str_putc(&w, *s++);
+      }
+      if (*s == q)
+        s++;
+      if (*n < MULTIWATCH_MAX) {
+        cmds[(*n)++] = w.data ? w.data : empty_str();
+      } else {
+        free(w.data);
+      }
+    } else {
+      Str w = {0};
+      while (*s && *s != ',' && (!has_bracket || *s != ']') && *s != '\n') {
+        str_putc(&w, *s++);
+      }
+      while (w.len > 0 && isspace((unsigned char)w.data[w.len - 1])) {
+        w.data[--w.len] = '\0';
+      }
+      if (w.len > 0 && *n < MULTIWATCH_MAX) {
+        cmds[(*n)++] = w.data;
+      } else {
+        free(w.data);
+      }
     }
-    return -1;
+    while (isspace((unsigned char)*s))
+      s++;
+    if (*s == ',')
+      s++;
   }
   while (isspace((unsigned char)*s))
     s++;
-  return (*s == '\0' && *n > 0) ? 0 : -1;
+  return *n > 0 ? 0 : -1;
 }
 
 static void multiwatch_print(const char *cmd, const char *data, ssize_t len) {
