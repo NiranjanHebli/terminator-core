@@ -87,6 +87,7 @@ static unsigned long col_branch;
 static unsigned long col_pill_bg;
 static unsigned long col_time;
 static unsigned long col_dim;
+static unsigned long col_quote;
 
 static unsigned long get_hex_color(const char *hex) {
   Colormap cmap = DefaultColormap(dpy, scr);
@@ -3868,6 +3869,190 @@ static void handle_tab_completion(Tab *cur) {
   tab_append_text(cur, list_buf, (int)off);
 }
 
+/* ---- Live Syntax Highlighting & Fish-Style Ghost Autosuggestions ---- */
+static int is_valid_command(const char *cmd, const char *cwd) {
+  if (!cmd || !*cmd)
+    return 0;
+
+  static const char *const builtins[] = {
+      "cd",      "exit",   "source", ".",          "export", "history",
+      "jobs",    "fg",     "bg",     "[",          "test",   "multiWatch",
+      "multiwatch", "bash","sh",     "if",         "then",   "elif",
+      "else",    "fi",     NULL};
+  for (int i = 0; builtins[i]; i++) {
+    if (strcmp(cmd, builtins[i]) == 0)
+      return 1;
+  }
+
+  /* Variable assignment VAR=val is valid syntax */
+  const char *eq = strchr(cmd, '=');
+  if (eq && eq > cmd && (isalpha((unsigned char)cmd[0]) || cmd[0] == '_')) {
+    int valid_var = 1;
+    for (const char *p = cmd; p < eq; p++) {
+      if (!(isalnum((unsigned char)*p) || *p == '_')) {
+        valid_var = 0;
+        break;
+      }
+    }
+    if (valid_var)
+      return 1;
+  }
+
+  /* Explicit path (e.g., ./run.sh or /bin/ls) */
+  if (strchr(cmd, '/')) {
+    char full[PATH_MAX * 2];
+    if (cmd[0] == '/')
+      snprintf(full, sizeof(full), "%s", cmd);
+    else
+      snprintf(full, sizeof(full), "%s/%s", (cwd && *cwd) ? cwd : ".", cmd);
+    struct stat st;
+    if (stat(full, &st) != 0 || S_ISDIR(st.st_mode))
+      return 0;
+    if (access(full, X_OK) == 0)
+      return 1;
+    size_t len = strlen(cmd);
+    if (len >= 3 && strcmp(cmd + len - 3, ".sh") == 0 &&
+        access(full, R_OK) == 0)
+      return 1;
+    return 0;
+  }
+
+  /* Cache the last looked-up command name to avoid scanning PATH on every frame */
+  static char cached_cmd[256] = "";
+  static char cached_cwd[PATH_MAX] = "";
+  static int cached_res = 0;
+  if (strcmp(cmd, cached_cmd) == 0 &&
+      strcmp(cwd ? cwd : "", cached_cwd) == 0) {
+    return cached_res;
+  }
+
+  snprintf(cached_cmd, sizeof(cached_cmd), "%s", cmd);
+  snprintf(cached_cwd, sizeof(cached_cwd), "%s", cwd ? cwd : "");
+  cached_res = 0;
+
+  /* Check if it is a .sh script in the tab's current directory */
+  size_t clen = strlen(cmd);
+  if (clen >= 3 && strcmp(cmd + clen - 3, ".sh") == 0) {
+    char local_p[PATH_MAX * 2];
+    snprintf(local_p, sizeof(local_p), "%s/%s", (cwd && *cwd) ? cwd : ".", cmd);
+    struct stat st;
+    if (stat(local_p, &st) == 0 && S_ISREG(st.st_mode)) {
+      cached_res = 1;
+      return 1;
+    }
+  }
+
+  const char *path_env = getenv("PATH");
+  if (!path_env)
+    return 0;
+  char *paths = strdup(path_env);
+  if (!paths)
+    return 0;
+
+  char *saveptr = NULL;
+  for (char *dir = strtok_r(paths, ":", &saveptr); dir;
+       dir = strtok_r(NULL, ":", &saveptr)) {
+    char full[PATH_MAX];
+    snprintf(full, sizeof(full), "%s/%s", dir, cmd);
+    struct stat st;
+    if (stat(full, &st) == 0 && S_ISREG(st.st_mode) &&
+        access(full, X_OK) == 0) {
+      cached_res = 1;
+      break;
+    }
+  }
+  free(paths);
+  return cached_res;
+}
+
+/* Scan shared_state->history backwards for most recent command starting with prefix */
+static int get_ghost_suggestion(const char *input, int input_len, char *suffix,
+                                size_t cap) {
+  suffix[0] = '\0';
+  if (input_len <= 0 || !shared_state)
+    return 0;
+
+  int found = 0;
+  shared_lock();
+  long total = shared_state->total;
+  long first = total > MAX_HISTORY ? total - MAX_HISTORY : 0;
+  for (long n = total - 1; n >= first; n--) {
+    const char *h = shared_state->history[n % MAX_HISTORY];
+    if (strncmp(h, input, (size_t)input_len) == 0 &&
+        strlen(h) > (size_t)input_len) {
+      snprintf(suffix, cap, "%s", h + input_len);
+      found = 1;
+      break;
+    }
+  }
+  shared_unlock();
+  return found;
+}
+
+static void draw_highlighted_input(Tab *cur, int px, int draw_y) {
+  const char *s = cur->input;
+  int len = cur->input_len;
+
+  /* Identify first word bounds [wstart, wend) */
+  int wstart = 0;
+  while (wstart < len && isspace((unsigned char)s[wstart]))
+    wstart++;
+  int wend = wstart;
+  while (wend < len && !isspace((unsigned char)s[wend]) && s[wend] != '|' &&
+         s[wend] != '<' && s[wend] != '>' && s[wend] != '&' && s[wend] != ';' &&
+         s[wend] != '\'' && s[wend] != '"') {
+    wend++;
+  }
+
+  unsigned long first_word_col = col_text;
+  if (wend > wstart) {
+    char word[256];
+    int wlen = wend - wstart;
+    if (wlen >= (int)sizeof(word))
+      wlen = (int)sizeof(word) - 1;
+    memcpy(word, s + wstart, (size_t)wlen);
+    word[wlen] = '\0';
+    first_word_col = is_valid_command(word, cur->cwd) ? col_prompt_user
+                                                      : col_prompt_arrow;
+  }
+
+  int in_squote = 0;
+  int in_dquote = 0;
+  for (int i = 0; i < len; i++) {
+    unsigned long c_col = col_text;
+    char c = s[i];
+
+    if (in_squote) {
+      c_col = col_quote;
+      if (c == '\'')
+        in_squote = 0;
+    } else if (in_dquote) {
+      c_col = col_quote;
+      if (c == '\\' && i + 1 < len) {
+        XSetForeground(dpy, gc, c_col);
+        XDrawString(dpy, win, gc, px + i * char_width, draw_y, &s[i], 2);
+        i++;
+        continue;
+      } else if (c == '"') {
+        in_dquote = 0;
+      }
+    } else {
+      if (c == '\'') {
+        in_squote = 1;
+        c_col = col_quote;
+      } else if (c == '"') {
+        in_dquote = 1;
+        c_col = col_quote;
+      } else if (i >= wstart && i < wend) {
+        c_col = first_word_col;
+      }
+    }
+
+    XSetForeground(dpy, gc, c_col);
+    XDrawString(dpy, win, gc, px + i * char_width, draw_y, &s[i], 1);
+  }
+}
+
 static void redraw(int win_w, int win_h) {
   XClearWindow(dpy, win);
 
@@ -3996,8 +4181,18 @@ static void redraw(int win_w, int win_h) {
       px += strlen(arr) * char_width;
     }
 
-    XSetForeground(dpy, gc, col_text);
-    XDrawString(dpy, win, gc, px, draw_y, cur->input, cur->input_len);
+    draw_highlighted_input(cur, px, draw_y);
+
+    char ghost_suffix[MAX_HIST_LEN];
+    int has_ghost = get_ghost_suggestion(cur->input, cur->input_len,
+                                         ghost_suffix, sizeof(ghost_suffix));
+    if (has_ghost) {
+      int ghost_x = px + cur->input_len * char_width;
+      XSetForeground(dpy, gc, col_dim);
+      XDrawString(dpy, win, gc, ghost_x, draw_y, ghost_suffix,
+                  strlen(ghost_suffix));
+    }
+
     int cursor_x = px + cur->input_pos * char_width;
 
     XSetForeground(dpy, gc, col_cursor);
@@ -4007,6 +4202,9 @@ static void redraw(int win_w, int win_h) {
       XSetForeground(dpy, gc, col_bg);
       XDrawString(dpy, win, gc, cursor_x, draw_y, &cur->input[cur->input_pos],
                   1);
+    } else if (has_ghost && ghost_suffix[0] != '\0') {
+      XSetForeground(dpy, gc, col_bg);
+      XDrawString(dpy, win, gc, cursor_x, draw_y, &ghost_suffix[0], 1);
     }
   }
 }
@@ -4079,6 +4277,7 @@ int main(int argc, char **argv) {
   col_pill_bg = get_hex_color("#242535");
   col_time = get_hex_color("#94e2d5");
   col_dim = get_hex_color("#6c7086");
+  col_quote = get_hex_color("#fab387");
 
   font = XLoadQueryFont(dpy, "9x15");
   if (!font)
@@ -4403,6 +4602,19 @@ int main(int argc, char **argv) {
             if (cur->input_pos < cur->input_len) {
               cur->input_pos++;
               redraw(win_w, win_h);
+            } else if (cur->input_pos == cur->input_len && cur->input_len > 0 &&
+                       cur->input_len < (int)sizeof(cur->input) - 1) {
+              char ghost_suf[MAX_HIST_LEN];
+              if (get_ghost_suggestion(cur->input, cur->input_len, ghost_suf,
+                                       sizeof(ghost_suf))) {
+                size_t glen = strlen(ghost_suf);
+                if ((size_t)cur->input_len + glen < sizeof(cur->input) - 1) {
+                  memcpy(cur->input + cur->input_len, ghost_suf, glen + 1);
+                  cur->input_len += (int)glen;
+                  cur->input_pos = cur->input_len;
+                  redraw(win_w, win_h);
+                }
+              }
             }
             break;
           case ACT_START_OF_LINE:

@@ -650,6 +650,13 @@ Terminator integrates a fuzzy typo suggestion subsystem based on the Damerau-Lev
   terminator: 'git cmmit' failed. Did you mean 'git commit'?
   ```
 
+### 7.7 Live Syntax Highlighting & Ghost Autosuggestions
+Terminator features real-time interactive input feedback directly in the X11 graphics context:
+- **Real-Time Command Highlighting:** As characters are typed into the input buffer, `is_valid_command()` inspects the initial command token. Recognized built-ins, scripts, and binaries discovered in `$PATH` are drawn in green (`#a6e3a1`), while unrecognized tokens are drawn in red/pink (`#f38ba8`).
+- **Quote Syntax Highlighting:** Single-quoted (`'...'`) and double-quoted (`"..."`) strings are styled dynamically in peach (`#fab387`).
+- **Fish-Style Ghost Autosuggestions:** `get_ghost_suggestion()` queries persistent history for the latest matching prefix. The suggested command tail is drawn inline ahead of the cursor in dimmed text (`#6c7086`).
+- **One-Key Acceptance:** Pressing the Right Arrow (`→`) key at the end of the line accepts the ghost suggestion immediately into the active input line.
+
 ---
 
 ## 8. Starship-Style Status Bar & Prompt Engine

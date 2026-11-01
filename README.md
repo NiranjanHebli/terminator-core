@@ -244,3 +244,9 @@ bind delete-word Alt+Backspace
 - **Fuzzy command matching:** Uses Damerau-Levenshtein edit distance to suggest matching built-ins or executables in `$PATH` when a command is not found (e.g., `sl` suggests `ls`).
 - **Subcommand matching for popular CLIs:** If commands like `git`, `docker`, `apt`, `npm`, or `cargo` fail due to a typo in the subcommand (e.g., `git cmmit`), Terminator suggests the intended subcommand (`Did you mean 'git commit'?`).
 
+#### Live Syntax Highlighting & Ghost Autosuggestions
+- **Real-time command validation:** Command token is colored green (`#a6e3a1`) if recognized and red/pink (`#f38ba8`) if invalid.
+- **Quote styling:** Single and double-quoted strings are highlighted in peach (`#fab387`).
+- **Fish-style ghost suggestions:** Automatically renders matching command tails from history in dimmed gray ahead of the cursor.
+- **Right Arrow acceptance:** Pressing `→` at the end of the input line instantly accepts the ghost suggestion.
+
