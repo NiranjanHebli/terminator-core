@@ -4,9 +4,8 @@
 # nested if/else control flow, and [ -f ... ] test evaluations.
 
 if [ -f "$1" ]; then
-    echo "File exists, compiling $1..."
-    gcc "$1" -o myprog
-    echo "Compilation successful! Output binary: myprog"
+    echo "File exists: $1"
+    echo "Verification successful for argument: $1"
 else
     echo "Source file missing: $1"
     echo "Usage: ./check.sh <source_file.c>"

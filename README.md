@@ -65,7 +65,7 @@ Terminator provides two execution architectures presenting identical behaviors:
 ### 1. Test Script Execution
 Run the bundled test script [check.sh](check.sh) natively inside Terminator:
 ```bash
-./check.sh terminal.c            # Tests [ -f ] true branch: compiles myprog
+./check.sh terminal.c            # Tests [ -f ] true branch: reports file exists
 ./check.sh missing_file.c        # Tests [ -f ] false branch: reports missing file
 ```
 
