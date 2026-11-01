@@ -2791,6 +2791,9 @@ static void close_tab(int idx) {
     __atomic_store_n(&shared_state->fg_pgid[tabs[idx].slot], 0,
                      __ATOMIC_SEQ_CST);
   }
+  if (tabs[idx].pid > 0) {
+    waitpid(tabs[idx].pid, NULL, WNOHANG);
+  }
   for (int i = idx; i < tab_count - 1; i++) {
     tabs[i] = tabs[i + 1];
   }
@@ -3356,6 +3359,7 @@ int main(int argc, char **argv) {
   int win_h = 520;
   win = XCreateSimpleWindow(dpy, RootWindow(dpy, scr), 100, 100, win_w, win_h,
                             1, col_tab_border, col_bg);
+  XStoreName(dpy, win, "Terminator");
 
   XSelectInput(dpy, win,
                ExposureMask | KeyPressMask | ButtonPressMask |
@@ -3409,30 +3413,24 @@ int main(int argc, char **argv) {
                 }
               }
               redraw(win_w, win_h);
-            } else if (n == 0) {
-              close(tabs[i].out_fd);
-              tabs[i].out_fd = -1;
-              /* a dead tab has no foreground job */
-              if (shared_state && tabs[i].slot >= 0 && tabs[i].slot < MAX_TABS)
-                __atomic_store_n(&shared_state->fg_pgid[tabs[i].slot], 0,
-                                 __ATOMIC_SEQ_CST);
-              if (tabs[i].closing) {
-                close_tab(i);
-                if (tab_count == 0) {
-                  running = 0;
-                  break;
-                }
-              } else {
-                const char *closed_msg = "[Process exited]\n";
-                tab_append_text(&tabs[i], closed_msg, strlen(closed_msg));
+            } else if (n == 0 || (n < 0 && errno != EAGAIN &&
+                                  errno != EWOULDBLOCK && errno != EINTR)) {
+              close_tab(i);
+              if (tab_count == 0) {
+                running = 0;
+                break;
               }
               redraw(win_w, win_h);
+              break;
             }
           }
           cur_idx++;
         }
       }
     }
+
+    if (!running)
+      break;
 
     while (XPending(dpy)) {
       XEvent ev;
@@ -3463,6 +3461,9 @@ int main(int argc, char **argv) {
           }
         }
       } else if (ev.type == KeyPress) {
+        if (active_tab < 0 || active_tab >= tab_count ||
+            tabs[active_tab].out_fd < 0)
+          continue;
         KeySym ks;
         char kbuf[32];
         int len = XLookupString(&ev.xkey, kbuf, sizeof(kbuf) - 1, &ks, NULL);
