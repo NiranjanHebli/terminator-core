@@ -732,6 +732,12 @@ sequenceDiagram
     Note over Display: redraw() renders:\n1. All historical lines in buffer (including previous status bars)\n2. New active status bar [~/path | on main --- took 8ms | at 12:00]\n3. New prompt: user@terminator> █
 ```
 
+### 8.3 Native Smooth Scrollback & Mouse Wheel Support
+- **Scrollback State (`scroll_offset`):** Each tab tracks `scroll_offset` (`0` = live view at bottom, `> 0` = scrolled up by `N` lines into historical output).
+- **Mouse Wheel & Keyboard Navigation:** X11 `ButtonPress` events on `Button4` (wheel up) and `Button5` (wheel down) adjust `scroll_offset` by 3 lines per tick. Keyboard bindings `Shift+PageUp` / `Shift+PageDown` (or `PageUp` / `PageDown`) jump by 10 lines.
+- **Visual Scrollbar & Badge:** `redraw()` renders a proportional scrollbar track and thumb on the right edge of the viewport, and overlays a `[+ N lines]` pill badge in the top-right corner when `scroll_offset > 0`.
+- **Auto-Scroll Reset:** Any keystroke or command submission automatically resets `scroll_offset = 0`, returning immediately to the active prompt.
+
 ---
 
 ## 9. Edge Cases, Error Handling & Invariants

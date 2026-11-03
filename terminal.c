@@ -58,6 +58,7 @@ typedef struct {
   char cwd[PATH_MAX];
   char lines[MAX_LINES][MAX_LINE_LEN];
   int line_count;
+  int scroll_offset; /* 0 = at bottom live view, > 0 = scrolled up N lines into history */
 } Tab;
 
 static Tab tabs[MAX_TABS];
@@ -3127,6 +3128,7 @@ static void create_tab(void) {
   if (!getcwd(t->cwd, sizeof(t->cwd)))
     snprintf(t->cwd, sizeof(t->cwd), ".");
   t->line_count = 0;
+  t->scroll_offset = 0;
 
   char welcome[128];
   if (use_process_mode) {
@@ -3197,6 +3199,8 @@ typedef enum {
   ACT_NEW_TAB,
   ACT_INTERRUPT,
   ACT_SUSPEND,
+  ACT_SCROLL_UP,
+  ACT_SCROLL_DOWN,
   ACT_COUNT
 } ActionId;
 
@@ -3225,6 +3229,8 @@ static void init_default_bindings(void) {
   bindings[ACT_NEW_TAB] = (KeyBinding){ControlMask, XK_t};
   bindings[ACT_INTERRUPT] = (KeyBinding){ControlMask, XK_c};
   bindings[ACT_SUSPEND] = (KeyBinding){ControlMask, XK_z};
+  bindings[ACT_SCROLL_UP] = (KeyBinding){ShiftMask, XK_Page_Up};
+  bindings[ACT_SCROLL_DOWN] = (KeyBinding){ShiftMask, XK_Page_Down};
 }
 
 static ActionId parse_action_name(const char *name) {
@@ -3235,9 +3241,11 @@ static ActionId parse_action_name(const char *name) {
       strcasecmp(name, "forward-char") == 0)
     return ACT_MOVE_RIGHT;
   if (strcasecmp(name, "start-of-line") == 0 ||
-      strcasecmp(name, "beginning-of-line") == 0)
+      strcasecmp(name, "beginning-of-line") == 0 ||
+      strcasecmp(name, "cursor-start") == 0)
     return ACT_START_OF_LINE;
-  if (strcasecmp(name, "end-of-line") == 0)
+  if (strcasecmp(name, "end-of-line") == 0 ||
+      strcasecmp(name, "cursor-end") == 0)
     return ACT_END_OF_LINE;
   if (strcasecmp(name, "browse-history-up") == 0 ||
       strcasecmp(name, "history-prev") == 0 ||
@@ -3279,6 +3287,10 @@ static ActionId parse_action_name(const char *name) {
     return ACT_INTERRUPT;
   if (strcasecmp(name, "suspend") == 0)
     return ACT_SUSPEND;
+  if (strcasecmp(name, "scroll-up") == 0)
+    return ACT_SCROLL_UP;
+  if (strcasecmp(name, "scroll-down") == 0)
+    return ACT_SCROLL_DOWN;
   return ACT_NONE;
 }
 
@@ -3313,6 +3325,16 @@ static int parse_key_combo(const char *str, KeyBinding *kb) {
         kb->sym = XK_Up;
       } else if (strcasecmp(tok, "down") == 0) {
         kb->sym = XK_Down;
+      } else if (strcasecmp(tok, "page_up") == 0 ||
+                 strcasecmp(tok, "pageup") == 0 ||
+                 strcasecmp(tok, "pgup") == 0 ||
+                 strcasecmp(tok, "prior") == 0) {
+        kb->sym = XK_Page_Up;
+      } else if (strcasecmp(tok, "page_down") == 0 ||
+                 strcasecmp(tok, "pagedown") == 0 ||
+                 strcasecmp(tok, "pgdn") == 0 ||
+                 strcasecmp(tok, "next") == 0) {
+        kb->sym = XK_Page_Down;
       } else if (strcasecmp(tok, "backspace") == 0) {
         kb->sym = XK_BackSpace;
       } else if (strcasecmp(tok, "delete") == 0) {
@@ -4131,23 +4153,82 @@ static void redraw(int win_w, int win_h) {
       tab_is_busy(active_tab)
           ? 0
           : ((cur->pending_len > 0 ? 1 : 2) * char_height + 14);
-  int avail_h = win_h - content_top - prompt_height;
-  if (avail_h < char_height)
-    avail_h = char_height;
+  int live_avail_h = win_h - content_top - prompt_height;
+  if (live_avail_h < char_height)
+    live_avail_h = char_height;
+
+  /* 1. Compute live_start: how many lines fit above the prompt at scroll_offset == 0 */
+  int live_used_h = 0;
+  int live_start = cur->line_count;
+  while (live_start > 0) {
+    int lh = is_bar_line(cur->lines[live_start - 1]) ? (char_height + 6)
+                                                     : char_height;
+    if (live_used_h + lh > live_avail_h && live_start < cur->line_count)
+      break;
+    live_used_h += lh;
+    live_start--;
+  }
+
+  /* 2. Compute top_fill_end: how many lines from index 0 fill the scroll viewport */
+  int scroll_avail_h = win_h - content_top - 10;
+  if (scroll_avail_h < char_height)
+    scroll_avail_h = char_height;
+
+  int top_used_h = 0;
+  int top_fill_end = 0;
+  while (top_fill_end < cur->line_count) {
+    int lh = is_bar_line(cur->lines[top_fill_end]) ? (char_height + 6)
+                                                   : char_height;
+    if (top_used_h + lh > scroll_avail_h && top_fill_end > 0)
+      break;
+    top_used_h += lh;
+    top_fill_end++;
+  }
+
+  /* 3. Determine exact max_scroll so start_line never goes past 0 and bottom never empties */
+  int max_scroll = 0;
+  int use_full_scroll_viewport = 0;
+  if (live_start > 0) {
+    if (cur->line_count > top_fill_end) {
+      max_scroll = cur->line_count - top_fill_end;
+      use_full_scroll_viewport = 1;
+    } else {
+      max_scroll = live_start;
+      use_full_scroll_viewport = 0;
+    }
+  }
+
+  if (cur->scroll_offset > max_scroll)
+    cur->scroll_offset = max_scroll;
+  if (cur->scroll_offset < 0)
+    cur->scroll_offset = 0;
+
+  int avail_h;
+  int end_line;
+  int show_prompt;
+  if (cur->scroll_offset > 0 && use_full_scroll_viewport) {
+    avail_h = scroll_avail_h;
+    end_line = cur->line_count - cur->scroll_offset;
+    show_prompt = 0;
+  } else {
+    avail_h = live_avail_h;
+    end_line = cur->line_count - cur->scroll_offset;
+    show_prompt = 1;
+  }
 
   int used_h = 0;
-  int start_line = cur->line_count;
+  int start_line = end_line;
   while (start_line > 0) {
     int lh = is_bar_line(cur->lines[start_line - 1]) ? (char_height + 6)
                                                      : char_height;
-    if (used_h + lh > avail_h && start_line < cur->line_count)
+    if (used_h + lh > avail_h && start_line < end_line)
       break;
     used_h += lh;
     start_line--;
   }
 
   int draw_y = content_top;
-  for (int i = start_line; i < cur->line_count; i++) {
+  for (int i = start_line; i < end_line; i++) {
     if (is_bar_line(cur->lines[i])) {
       char cwd[512], br[64], dur[64], tm[32];
       int right_is_err = 0;
@@ -4163,79 +4244,131 @@ static void redraw(int win_w, int win_h) {
     }
   }
 
-  if (cur->searching) {
-    const char *srch_prompt = "Enter search term: ";
+  /* Draw Scrollbar Track & Thumb on the right edge when content exceeds viewport */
+  if (max_scroll > 0) {
+    int track_x = win_w - 7;
+    int track_y = content_top - font_ascent;
+    int track_h = win_h - track_y - 8;
+    int track_w = 3;
+
+    if (track_h > 20) {
+      XSetForeground(dpy, gc, col_tab_border);
+      XFillRectangle(dpy, win, gc, track_x, track_y, track_w, track_h);
+
+      int visible_lines = end_line - start_line;
+      int thumb_h = (track_h * visible_lines) / cur->line_count;
+      if (thumb_h < 14)
+        thumb_h = 14;
+      if (thumb_h > track_h)
+        thumb_h = track_h;
+
+      double frac =
+          (double)(max_scroll - cur->scroll_offset) / (double)max_scroll;
+      if (frac < 0.0)
+        frac = 0.0;
+      if (frac > 1.0)
+        frac = 1.0;
+      int thumb_y = track_y + (int)(frac * (track_h - thumb_h));
+
+      XSetForeground(dpy, gc, col_tab_active_fg);
+      XFillRectangle(dpy, win, gc, track_x, thumb_y, track_w, thumb_h);
+    }
+  }
+
+  /* Draw Scrollback Indicator Badge in the Tab Bar header when scrolled up */
+  if (cur->scroll_offset > 0) {
+    char badge[48];
+    snprintf(badge, sizeof(badge), "[+ %d lines]", cur->scroll_offset);
+    int blen = (int)strlen(badge);
+    int pad = 8;
+    int bw = blen * char_width + pad * 2;
+    int bh = TAB_BAR_HEIGHT - 8;
+    int bx = win_w - 12 - bw;
+    int by = 4;
+
+    XSetForeground(dpy, gc, col_pill_bg);
+    XFillRectangle(dpy, win, gc, bx, by, bw, bh);
+
     XSetForeground(dpy, gc, col_prompt_arrow);
-    XDrawString(dpy, win, gc, 16, draw_y, srch_prompt, strlen(srch_prompt));
-    int spx = 16 + strlen(srch_prompt) * char_width;
+    XDrawRectangle(dpy, win, gc, bx, by, bw, bh);
+    XDrawString(dpy, win, gc, bx + pad, by + font_ascent + 2, badge, blen);
+  }
 
-    XSetForeground(dpy, gc, col_text);
-    XDrawString(dpy, win, gc, spx, draw_y, cur->search, cur->search_len);
-    int cursor_x = spx + cur->search_len * char_width;
-
-    XSetForeground(dpy, gc, col_cursor);
-    XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
-                   char_height);
-  } else if (!tab_is_busy(active_tab)) {
-    char abbrev_cwd[512];
-    abbreviate_path(cur->cwd, abbrev_cwd, sizeof(abbrev_cwd));
-
-    if (cur->pending_len == 0) {
-      char branch[64];
-      char dur_str[64];
-      char time_str[32];
-      int right_is_err = 0;
-      get_current_bar_info(cur, abbrev_cwd, sizeof(abbrev_cwd), branch,
-                           sizeof(branch), dur_str, sizeof(dur_str), time_str,
-                           sizeof(time_str), &right_is_err);
-
-      draw_status_bar(draw_y, abbrev_cwd, branch, dur_str, time_str,
-                      right_is_err, win_w);
-      draw_y += char_height + 6;
-    }
-
-    // Now render the input prompt line
-    int px = 16;
-    if (cur->pending_len > 0) {
+  if (show_prompt) {
+    if (cur->searching) {
+      const char *srch_prompt = "Enter search term: ";
       XSetForeground(dpy, gc, col_prompt_arrow);
-      XDrawString(dpy, win, gc, px, draw_y, CONT_PROMPT, strlen(CONT_PROMPT));
-      px += strlen(CONT_PROMPT) * char_width;
-    } else {
-      const char *user_str = "user@terminator";
-      XSetForeground(dpy, gc, col_prompt_user);
-      XDrawString(dpy, win, gc, px, draw_y, user_str, strlen(user_str));
-      px += strlen(user_str) * char_width;
+      XDrawString(dpy, win, gc, 16, draw_y, srch_prompt, strlen(srch_prompt));
+      int spx = 16 + strlen(srch_prompt) * char_width;
 
-      const char *arr = "> ";
-      XSetForeground(dpy, gc, col_prompt_arrow);
-      XDrawString(dpy, win, gc, px, draw_y, arr, strlen(arr));
-      px += strlen(arr) * char_width;
-    }
+      XSetForeground(dpy, gc, col_text);
+      XDrawString(dpy, win, gc, spx, draw_y, cur->search, cur->search_len);
+      int cursor_x = spx + cur->search_len * char_width;
 
-    draw_highlighted_input(cur, px, draw_y);
+      XSetForeground(dpy, gc, col_cursor);
+      XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
+                     char_height);
+    } else if (!tab_is_busy(active_tab)) {
+      char abbrev_cwd[512];
+      abbreviate_path(cur->cwd, abbrev_cwd, sizeof(abbrev_cwd));
 
-    char ghost_suffix[MAX_HIST_LEN];
-    int has_ghost = get_ghost_suggestion(cur->input, cur->input_len,
-                                         ghost_suffix, sizeof(ghost_suffix));
-    if (has_ghost) {
-      int ghost_x = px + cur->input_len * char_width;
-      XSetForeground(dpy, gc, col_dim);
-      XDrawString(dpy, win, gc, ghost_x, draw_y, ghost_suffix,
-                  strlen(ghost_suffix));
-    }
+      if (cur->pending_len == 0) {
+        char branch[64];
+        char dur_str[64];
+        char time_str[32];
+        int right_is_err = 0;
+        get_current_bar_info(cur, abbrev_cwd, sizeof(abbrev_cwd), branch,
+                             sizeof(branch), dur_str, sizeof(dur_str), time_str,
+                             sizeof(time_str), &right_is_err);
 
-    int cursor_x = px + cur->input_pos * char_width;
+        draw_status_bar(draw_y, abbrev_cwd, branch, dur_str, time_str,
+                        right_is_err, win_w);
+        draw_y += char_height + 6;
+      }
 
-    XSetForeground(dpy, gc, col_cursor);
-    XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
-                   char_height);
-    if (cur->input_pos < cur->input_len) {
-      XSetForeground(dpy, gc, col_bg);
-      XDrawString(dpy, win, gc, cursor_x, draw_y, &cur->input[cur->input_pos],
-                  1);
-    } else if (has_ghost && ghost_suffix[0] != '\0') {
-      XSetForeground(dpy, gc, col_bg);
-      XDrawString(dpy, win, gc, cursor_x, draw_y, &ghost_suffix[0], 1);
+      // Now render the input prompt line
+      int px = 16;
+      if (cur->pending_len > 0) {
+        XSetForeground(dpy, gc, col_prompt_arrow);
+        XDrawString(dpy, win, gc, px, draw_y, CONT_PROMPT, strlen(CONT_PROMPT));
+        px += strlen(CONT_PROMPT) * char_width;
+      } else {
+        const char *user_str = "user@terminator";
+        XSetForeground(dpy, gc, col_prompt_user);
+        XDrawString(dpy, win, gc, px, draw_y, user_str, strlen(user_str));
+        px += strlen(user_str) * char_width;
+
+        const char *arr = "> ";
+        XSetForeground(dpy, gc, col_prompt_arrow);
+        XDrawString(dpy, win, gc, px, draw_y, arr, strlen(arr));
+        px += strlen(arr) * char_width;
+      }
+
+      draw_highlighted_input(cur, px, draw_y);
+
+      char ghost_suffix[MAX_HIST_LEN];
+      int has_ghost = get_ghost_suggestion(cur->input, cur->input_len,
+                                           ghost_suffix, sizeof(ghost_suffix));
+      if (has_ghost) {
+        int ghost_x = px + cur->input_len * char_width;
+        XSetForeground(dpy, gc, col_dim);
+        XDrawString(dpy, win, gc, ghost_x, draw_y, ghost_suffix,
+                    strlen(ghost_suffix));
+      }
+
+      int cursor_x = px + cur->input_pos * char_width;
+
+      XSetForeground(dpy, gc, col_cursor);
+      XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
+                     char_height);
+      if (cur->input_pos < cur->input_len) {
+        XSetForeground(dpy, gc, col_bg);
+        XDrawString(dpy, win, gc, cursor_x, draw_y, &cur->input[cur->input_pos],
+                    1);
+      } else if (has_ghost && ghost_suffix[0] != '\0') {
+        XSetForeground(dpy, gc, col_bg);
+        XDrawString(dpy, win, gc, cursor_x, draw_y, &ghost_suffix[0], 1);
+      }
     }
   }
 }
@@ -4481,6 +4614,21 @@ int main(int argc, char **argv) {
             create_tab();
             redraw(win_w, win_h);
           }
+        } else if (active_tab >= 0 && active_tab < tab_count) {
+          Tab *cur = &tabs[active_tab];
+          if (ev.xbutton.button == 4) {
+            /* Mouse wheel UP: scroll back into history */
+            cur->scroll_offset += 3;
+            if (cur->scroll_offset > cur->line_count - 1)
+              cur->scroll_offset = cur->line_count > 0 ? cur->line_count - 1 : 0;
+            redraw(win_w, win_h);
+          } else if (ev.xbutton.button == 5) {
+            /* Mouse wheel DOWN: scroll forward toward live stream */
+            cur->scroll_offset -= 3;
+            if (cur->scroll_offset < 0)
+              cur->scroll_offset = 0;
+            redraw(win_w, win_h);
+          }
         }
       } else if (ev.type == KeyPress) {
         if (active_tab < 0 || active_tab >= tab_count ||
@@ -4504,8 +4652,29 @@ int main(int argc, char **argv) {
           }
         }
 
+        if (action == ACT_NONE) {
+          if (ks == XK_Page_Up || ks == XK_Prior) {
+            action = ACT_SCROLL_UP;
+          } else if (ks == XK_Page_Down || ks == XK_Next) {
+            action = ACT_SCROLL_DOWN;
+          }
+        }
+
         if (tab_is_busy(active_tab)) {
-          if (action == ACT_INTERRUPT) {
+          if (action == ACT_SCROLL_UP) {
+            cur->scroll_offset += 10;
+            if (cur->scroll_offset > cur->line_count - 1)
+              cur->scroll_offset = cur->line_count > 0 ? cur->line_count - 1 : 0;
+            redraw(win_w, win_h);
+            continue;
+          } else if (action == ACT_SCROLL_DOWN) {
+            cur->scroll_offset -= 10;
+            if (cur->scroll_offset < 0)
+              cur->scroll_offset = 0;
+            redraw(win_w, win_h);
+            continue;
+          } else if (action == ACT_INTERRUPT) {
+            cur->scroll_offset = 0;
             int job_signalled = signal_tab_job(active_tab, SIGINT);
             tab_append_text(cur, "^C\n", 3);
             if (!job_signalled) {
@@ -4535,6 +4704,7 @@ int main(int argc, char **argv) {
             cur->hist_pos = 0;
             redraw(win_w, win_h);
           } else if (action == ACT_SUSPEND) {
+            cur->scroll_offset = 0;
             if (signal_tab_job(active_tab, SIGTSTP)) {
               tab_append_text(cur, "^Z\n", 3);
               redraw(win_w, win_h);
@@ -4554,6 +4724,7 @@ int main(int argc, char **argv) {
         }
 
         if (cur->searching) {
+          cur->scroll_offset = 0;
           if (action == ACT_INTERRUPT || ks == XK_Escape) {
             cur->searching = 0;
             cur->search_len = 0;
@@ -4607,6 +4778,7 @@ int main(int argc, char **argv) {
             int pick = kbuf[0] - '1';
             if (pick < cur->comp_count) {
               cur->completing = 0;
+              cur->scroll_offset = 0;
               replace_input_range(cur, cur->comp_replace_start, cur->input_pos,
                                   cur->comp_matches[pick]);
               redraw(win_w, win_h);
@@ -4618,11 +4790,24 @@ int main(int argc, char **argv) {
             cur->completing = 0;
           }
           switch (action) {
+          case ACT_SCROLL_UP:
+            cur->scroll_offset += 10;
+            if (cur->scroll_offset > cur->line_count - 1)
+              cur->scroll_offset = cur->line_count > 0 ? cur->line_count - 1 : 0;
+            redraw(win_w, win_h);
+            break;
+          case ACT_SCROLL_DOWN:
+            cur->scroll_offset -= 10;
+            if (cur->scroll_offset < 0)
+              cur->scroll_offset = 0;
+            redraw(win_w, win_h);
+            break;
           case ACT_NEW_TAB:
             create_tab();
             redraw(win_w, win_h);
             break;
           case ACT_INTERRUPT: {
+            cur->scroll_offset = 0;
             /* signal the foreground job, else make the shell drop the line */
             int job_signalled = signal_tab_job(active_tab, SIGINT);
             if (!job_signalled) {
@@ -4660,18 +4845,21 @@ int main(int argc, char **argv) {
             break;
           }
           case ACT_SUSPEND: /* stop the foreground job */
+            cur->scroll_offset = 0;
             if (signal_tab_job(active_tab, SIGTSTP)) {
               tab_append_text(cur, "^Z\n", 3);
               redraw(win_w, win_h);
             }
             break;
           case ACT_MOVE_LEFT:
+            cur->scroll_offset = 0;
             if (cur->input_pos > 0) {
               cur->input_pos--;
               redraw(win_w, win_h);
             }
             break;
           case ACT_MOVE_RIGHT:
+            cur->scroll_offset = 0;
             if (cur->input_pos < cur->input_len) {
               cur->input_pos++;
               redraw(win_w, win_h);
@@ -4691,14 +4879,17 @@ int main(int argc, char **argv) {
             }
             break;
           case ACT_START_OF_LINE:
+            cur->scroll_offset = 0;
             cur->input_pos = 0;
             redraw(win_w, win_h);
             break;
           case ACT_END_OF_LINE:
+            cur->scroll_offset = 0;
             cur->input_pos = cur->input_len;
             redraw(win_w, win_h);
             break;
           case ACT_HIST_PREV: /* history is shared by every tab */
+            cur->scroll_offset = 0;
             if (cur->pending_len == 0) {
               char h[MAX_HIST_LEN];
               if (history_get_back(cur->hist_pos + 1, h, sizeof(h))) {
@@ -4714,6 +4905,7 @@ int main(int argc, char **argv) {
             }
             break;
           case ACT_HIST_NEXT:
+            cur->scroll_offset = 0;
             if (cur->pending_len == 0 && cur->hist_pos > 0) {
               char h[MAX_HIST_LEN];
               cur->hist_pos--;
@@ -4728,6 +4920,7 @@ int main(int argc, char **argv) {
             }
             break;
           case ACT_DEL_TO_START:
+            cur->scroll_offset = 0;
             if (cur->input_pos > 0) {
               memmove(cur->input, cur->input + cur->input_pos,
                       cur->input_len - cur->input_pos + 1);
@@ -4737,6 +4930,7 @@ int main(int argc, char **argv) {
             }
             break;
           case ACT_DEL_TO_END:
+            cur->scroll_offset = 0;
             if (cur->input_pos < cur->input_len) {
               cur->input[cur->input_pos] = '\0';
               cur->input_len = cur->input_pos;
@@ -4744,6 +4938,7 @@ int main(int argc, char **argv) {
             }
             break;
           case ACT_DEL_WORD:
+            cur->scroll_offset = 0;
             if (cur->input_pos > 0) {
               int p = cur->input_pos;
               while (p > 0 && isspace((unsigned char)cur->input[p - 1]))
@@ -4758,11 +4953,13 @@ int main(int argc, char **argv) {
             }
             break;
           case ACT_CLEAR_SCREEN:
+            cur->scroll_offset = 0;
             cur->line_count = 0;
             cur->lines[0][0] = '\0';
             redraw(win_w, win_h);
             break;
           case ACT_CLOSE_TAB:
+            cur->scroll_offset = 0;
             if (cur->input_len == 0 && cur->pending_len == 0) {
               if (cur->out_fd < 0) {
                 close_tab(active_tab);
@@ -4801,6 +4998,7 @@ int main(int argc, char **argv) {
             }
             break;
           case ACT_PASTE:
+            cur->scroll_offset = 0;
             if (shared_state) {
               shared_lock();
               char clip[4096];
@@ -4820,6 +5018,7 @@ int main(int argc, char **argv) {
             }
             break;
           case ACT_SEARCH_HIST:
+            cur->scroll_offset = 0;
             cur->searching = 1;
             cur->search[0] = '\0';
             cur->search_len = 0;
@@ -4828,9 +5027,11 @@ int main(int argc, char **argv) {
           case ACT_NONE:
           default:
             if (ks == XK_Tab && !(mod & (ControlMask | Mod1Mask))) {
+              cur->scroll_offset = 0;
               handle_tab_completion(cur);
               redraw(win_w, win_h);
             } else if (ks == XK_BackSpace) {
+              cur->scroll_offset = 0;
               if (cur->input_pos > 0) {
                 memmove(cur->input + cur->input_pos - 1,
                         cur->input + cur->input_pos,
@@ -4840,6 +5041,7 @@ int main(int argc, char **argv) {
                 redraw(win_w, win_h);
               }
             } else if (ks == XK_Return) {
+              cur->scroll_offset = 0;
               if (cur->pending_len == 0) {
                 append_status_bar_line(cur);
               }
@@ -4895,6 +5097,7 @@ int main(int argc, char **argv) {
             } else if (len > 0 && (unsigned char)kbuf[0] >= 32 &&
                        (unsigned char)kbuf[0] <= 126 &&
                        !(mod & (ControlMask | Mod1Mask))) {
+              cur->scroll_offset = 0;
               if (cur->input_len < (int)sizeof(cur->input) - 2) {
                 memmove(cur->input + cur->input_pos + 1,
                         cur->input + cur->input_pos,

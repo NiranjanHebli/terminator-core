@@ -217,6 +217,8 @@ There is no TTY, so the kernel never turns Ctrl+C / Ctrl+Z into signals. The GUI
 | Clipboard | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy current line to / paste from shared clipboard |
 | Tab management | `Ctrl+T` | Create new tab |
 | Signals | `Ctrl+C` / `Ctrl+Z` | Interrupt / suspend foreground job |
+| Scrollback | `Shift+PageUp` / `Shift+PageDown` | Scroll up / down 10 lines through output history |
+| Mouse wheel | `Wheel Up` / `Wheel Down` | Scroll up / down 3 lines per tick |
 
 #### Keybinding Configuration (`~/.terminatorrc`)
 Custom bindings survive restarts and can be reconfigured without recompiling via `~/.terminatorrc` (or `$TERMINATOR_RC`):
@@ -266,4 +268,10 @@ bind delete-word Alt+Backspace
 - **Unread notification dot:** When a background tab produces output or completes a running task, a colored notification badge appears on its tab bar.
 - **X11 notification bell:** Triggers an audible alert (`XBell`) when background tasks generate output or finish executing.
 - **Auto-dismiss on focus:** Switching to or clicking on an unread tab instantly dismisses its notification dot.
+
+#### Native Smooth Scrollback & Mouse Wheel Support
+- **Per-tab scrollback buffer:** Inspect up to 1,000 lines of historical output per tab using `scroll_offset` without losing live incoming streams.
+- **Mouse wheel & keyboard navigation:** Scroll smoothly by 3 lines per tick using the mouse wheel (`Button4` / `Button5`) or jump 10 lines at a time via `Shift+PageUp` / `Shift+PageDown` (or `PageUp` / `PageDown`).
+- **Proportional scrollbar & floating indicator badge:** Renders a dynamic scrollbar track and thumb along the right edge of the window, plus a floating `[+ N lines]` badge in the top-right corner whenever viewing historical output.
+- **Auto-scroll on input:** Typing any key or submitting a command automatically resets the viewport to the live prompt at the bottom.
 
