@@ -58,7 +58,8 @@ typedef struct {
   char cwd[PATH_MAX];
   char lines[MAX_LINES][MAX_LINE_LEN];
   int line_count;
-  int scroll_offset; /* 0 = at bottom live view, > 0 = scrolled up N lines into history */
+  int scroll_offset; /* 0 = at bottom live view, > 0 = scrolled up N lines into
+                        history */
 } Tab;
 
 static Tab tabs[MAX_TABS];
@@ -589,7 +590,8 @@ static void set_foreground(pid_t pgid) {
     headless_fg_pgid = pgid;
 }
 
-/* Mark this tab as busy executing a command (1) or idle waiting for input (0) */
+/* Mark this tab as busy executing a command (1) or idle waiting for input (0)
+ */
 static void set_tab_busy(int b) {
   if (tab_slot >= 0 && shared_state)
     __atomic_store_n(&shared_state->busy[tab_slot], b, __ATOMIC_SEQ_CST);
@@ -1852,9 +1854,9 @@ static void suggest_similar_command(const char *bad_cmd, char *best_match,
     return;
 
   static const char *const builtins[] = {
-      "cd",      "exit",   "source", "export",     "history", "jobs",
-      "fg",      "bg",     "test",   "multiWatch", "bash",    "sh",
-      "if",      "then",   "elif",   "else",       "fi",      NULL};
+      "cd", "exit", "source", "export",     "history", "jobs",
+      "fg", "bg",   "test",   "multiWatch", "bash",    "sh",
+      "if", "then", "elif",   "else",       "fi",      NULL};
 
   int best_d = 3; /* suggest only when edit distance <= 2 */
   size_t blen = strlen(bad_cmd);
@@ -1909,42 +1911,38 @@ static void check_subcommand_suggestion(int argc, char **argv, int status) {
     return;
 
   static const char *const git_subs[] = {
-      "add",      "bisect",     "branch",   "checkout", "cherry-pick",
-      "clean",    "clone",      "commit",   "config",   "diff",
-      "fetch",    "grep",       "init",     "log",      "merge",
-      "mv",       "pull",       "push",     "rebase",   "remote",
-      "reset",    "restore",    "revert",   "rm",       "show",
-      "stash",    "status",     "submodule","switch",   "tag",
+      "add",      "bisect", "branch", "checkout",  "cherry-pick", "clean",
+      "clone",    "commit", "config", "diff",      "fetch",       "grep",
+      "init",     "log",    "merge",  "mv",        "pull",        "push",
+      "rebase",   "remote", "reset",  "restore",   "revert",      "rm",
+      "show",     "stash",  "status", "submodule", "switch",      "tag",
       "worktree", NULL};
 
   static const char *const docker_subs[] = {
-      "build", "commit",  "compose", "container", "cp",     "create",
-      "diff",  "events",  "exec",    "export",    "history", "image",
-      "images","import",  "info",    "inspect",   "kill",   "load",
-      "login", "logout",  "logs",    "network",   "node",   "pause",
-      "port",  "ps",      "pull",    "push",      "rename", "restart",
-      "rm",    "rmi",     "run",     "save",      "search", "service",
-      "start", "stats",   "stop",    "swarm",     "system", "tag",
-      "top",   "unpause", "update",  "version",   "volume", "wait",
+      "build",  "commit",  "compose", "container", "cp",      "create",
+      "diff",   "events",  "exec",    "export",    "history", "image",
+      "images", "import",  "info",    "inspect",   "kill",    "load",
+      "login",  "logout",  "logs",    "network",   "node",    "pause",
+      "port",   "ps",      "pull",    "push",      "rename",  "restart",
+      "rm",     "rmi",     "run",     "save",      "search",  "service",
+      "start",  "stats",   "stop",    "swarm",     "system",  "tag",
+      "top",    "unpause", "update",  "version",   "volume",  "wait",
       NULL};
 
   static const char *const apt_subs[] = {
-      "install",      "remove",  "purge",      "update",   "upgrade",
-      "full-upgrade", "search",  "show",       "list",     "autoremove",
-      "clean",        "depends", "rdepends",   "policy",   "source",
-      NULL};
+      "install",  "remove", "purge",  "update",     "upgrade", "full-upgrade",
+      "search",   "show",   "list",   "autoremove", "clean",   "depends",
+      "rdepends", "policy", "source", NULL};
 
   static const char *const npm_subs[] = {
-      "install", "uninstall", "update", "run",     "start", "test",
-      "build",   "init",      "publish","audit",   "ci",    "cache",
-      "config",  "exec",      "list",   "outdated","pack",  "version",
-      NULL};
+      "install", "uninstall", "update", "run",     "start", "test",   "build",
+      "init",    "publish",   "audit",  "ci",      "cache", "config", "exec",
+      "list",    "outdated",  "pack",   "version", NULL};
 
   static const char *const cargo_subs[] = {
-      "build", "check", "clean", "doc",     "new",    "init",
-      "add",   "remove","run",   "test",    "bench",  "update",
-      "search","publish","install","uninstall","clippy","fmt",
-      NULL};
+      "build",   "check",     "clean",  "doc",   "new",    "init",   "add",
+      "remove",  "run",       "test",   "bench", "update", "search", "publish",
+      "install", "uninstall", "clippy", "fmt",   NULL};
 
   const char *cmd = strrchr(argv[0], '/');
   cmd = cmd ? cmd + 1 : argv[0];
@@ -2982,7 +2980,8 @@ static pid_t tab_foreground_pgid(int idx) {
   return (pid_t)__atomic_load_n(&shared_state->fg_pgid[s], __ATOMIC_SEQ_CST);
 }
 
-/* Check whether tab idx is currently executing a command or foreground process */
+/* Check whether tab idx is currently executing a command or foreground process
+ */
 static int tab_is_busy(int idx) {
   if (!shared_state || idx < 0 || idx >= tab_count)
     return 0;
@@ -3031,7 +3030,8 @@ static void create_tab(void) {
     __atomic_store_n(&shared_state->last_duration_ms[slot], -1L,
                      __ATOMIC_SEQ_CST);
     __atomic_store_n(&shared_state->last_status[slot], 0, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&shared_state->last_interrupted[slot], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&shared_state->last_interrupted[slot], 0,
+                     __ATOMIC_SEQ_CST);
     time_t now = time(NULL);
     struct tm tm_i;
     localtime_r(&now, &tm_i);
@@ -3130,6 +3130,17 @@ static void create_tab(void) {
   t->line_count = 0;
   t->scroll_offset = 0;
 
+  char welcome[128];
+  if (use_process_mode) {
+    snprintf(welcome, sizeof(welcome),
+             "Terminator Tab %d (process mode, PID: %d ready)\n", t->id,
+             (int)pid);
+  } else {
+    snprintf(welcome, sizeof(welcome),
+             "Terminator Tab %d (thread mode ready)\n", t->id);
+  }
+  tab_append_text(t, welcome, strlen(welcome));
+
   active_tab = tab_count;
   tab_count++;
 }
@@ -3146,8 +3157,7 @@ static void close_tab(int idx) {
     tabs[idx].out_fd = -1;
   }
   if (shared_state && tabs[idx].slot >= 0 && tabs[idx].slot < MAX_TABS) {
-    __atomic_store_n(&shared_state->busy[tabs[idx].slot], 0,
-                     __ATOMIC_SEQ_CST);
+    __atomic_store_n(&shared_state->busy[tabs[idx].slot], 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&shared_state->fg_pgid[tabs[idx].slot], 0,
                      __ATOMIC_SEQ_CST);
     __atomic_store_n(&shared_state->last_duration_ms[tabs[idx].slot], -1L,
@@ -3238,6 +3248,7 @@ static ActionId parse_action_name(const char *name) {
     return ACT_END_OF_LINE;
   if (strcasecmp(name, "browse-history-up") == 0 ||
       strcasecmp(name, "history-prev") == 0 ||
+      strcasecmp(name, "prev-history") == 0 ||
       strcasecmp(name, "previous-history") == 0 ||
       strcasecmp(name, "history-up") == 0)
     return ACT_HIST_PREV;
@@ -3276,9 +3287,13 @@ static ActionId parse_action_name(const char *name) {
     return ACT_INTERRUPT;
   if (strcasecmp(name, "suspend") == 0)
     return ACT_SUSPEND;
-  if (strcasecmp(name, "scroll-up") == 0)
+  if (strcasecmp(name, "scroll-up") == 0 ||
+      strcasecmp(name, "scrollback-up") == 0 ||
+      strcasecmp(name, "page-up") == 0)
     return ACT_SCROLL_UP;
-  if (strcasecmp(name, "scroll-down") == 0)
+  if (strcasecmp(name, "scroll-down") == 0 ||
+      strcasecmp(name, "scrollback-down") == 0 ||
+      strcasecmp(name, "page-down") == 0)
     return ACT_SCROLL_DOWN;
   return ACT_NONE;
 }
@@ -3300,7 +3315,9 @@ static int parse_key_combo(const char *str, KeyBinding *kb) {
         kb->mod |= ShiftMask;
       } else if (strcasecmp(tok, "alt") == 0 || strcasecmp(tok, "mod1") == 0 ||
                  strcasecmp(tok, "meta") == 0 || strcasecmp(tok, "opt") == 0 ||
-                 strcasecmp(tok, "option") == 0) {
+                 strcasecmp(tok, "option") == 0 || strcasecmp(tok, "cmd") == 0 ||
+                 strcasecmp(tok, "command") == 0 || strcasecmp(tok, "super") == 0 ||
+                 strcasecmp(tok, "mod4") == 0 || strcasecmp(tok, "mod5") == 0) {
         kb->mod |= Mod1Mask;
       } else {
         return -1;
@@ -3321,12 +3338,11 @@ static int parse_key_combo(const char *str, KeyBinding *kb) {
         kb->sym = XK_Page_Up;
       } else if (strcasecmp(tok, "page_down") == 0 ||
                  strcasecmp(tok, "pagedown") == 0 ||
-                 strcasecmp(tok, "pgdn") == 0 ||
-                 strcasecmp(tok, "next") == 0) {
+                 strcasecmp(tok, "pgdn") == 0 || strcasecmp(tok, "next") == 0) {
         kb->sym = XK_Page_Down;
       } else if (strcasecmp(tok, "backspace") == 0) {
         kb->sym = XK_BackSpace;
-      } else if (strcasecmp(tok, "delete") == 0) {
+      } else if (strcasecmp(tok, "delete") == 0 || strcasecmp(tok, "del") == 0) {
         kb->sym = XK_Delete;
       } else if (strcasecmp(tok, "return") == 0 ||
                  strcasecmp(tok, "enter") == 0) {
@@ -3335,6 +3351,12 @@ static int parse_key_combo(const char *str, KeyBinding *kb) {
         kb->sym = XK_space;
       } else if (strcasecmp(tok, "tab") == 0) {
         kb->sym = XK_Tab;
+      } else if (strcasecmp(tok, "escape") == 0 || strcasecmp(tok, "esc") == 0) {
+        kb->sym = XK_Escape;
+      } else if (strcasecmp(tok, "home") == 0) {
+        kb->sym = XK_Home;
+      } else if (strcasecmp(tok, "end") == 0) {
+        kb->sym = XK_End;
       } else if (strlen(tok) == 1) {
         char c = tok[0];
         if (c >= 'A' && c <= 'Z')
@@ -3365,28 +3387,54 @@ static int parse_key_combo(const char *str, KeyBinding *kb) {
   return (kb->sym != NoSymbol) ? 0 : -1;
 }
 
-static void load_config(void) {
+static void load_config(const char *cli_path) {
   init_default_bindings();
 
   char path[PATH_MAX];
-  const char *rc = getenv("TERMINATOR_RC");
-  const char *home = getenv("HOME");
-  if (rc && *rc) {
-    snprintf(path, sizeof(path), "%s", rc);
-  } else if (home && *home) {
-    snprintf(path, sizeof(path), "%s/.terminatorrc", home);
+  path[0] = '\0';
+
+  if (cli_path && *cli_path) {
+    snprintf(path, sizeof(path), "%s", cli_path);
   } else {
-    return;
+    const char *rc = getenv("TERMINATOR_RC");
+    const char *home = getenv("HOME");
+    if (rc && *rc && access(rc, R_OK) == 0) {
+      snprintf(path, sizeof(path), "%s", rc);
+    } else if (home && *home) {
+      char home_rc[PATH_MAX];
+      snprintf(home_rc, sizeof(home_rc), "%s/.terminatorrc", home);
+      if (access(home_rc, R_OK) == 0) {
+        snprintf(path, sizeof(path), "%s", home_rc);
+      }
+    }
+
+    if (!path[0]) {
+      if (access(".terminatorrc", R_OK) == 0) {
+        snprintf(path, sizeof(path), ".terminatorrc");
+      } else if (access("sample.terminatorrc", R_OK) == 0) {
+        snprintf(path, sizeof(path), "sample.terminatorrc");
+      } else if (access("terminatorrc", R_OK) == 0) {
+        snprintf(path, sizeof(path), "terminatorrc");
+      }
+    }
   }
 
-  FILE *f = fopen(path, "r");
-  if (!f)
+  if (!path[0])
     return;
+
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    if (cli_path)
+      fprintf(stderr, "terminator: cannot open config file '%s': %s\n", path,
+              strerror(errno));
+    return;
+  }
 
   char *line = NULL;
   size_t cap = 0;
   ssize_t n;
   int line_no = 0;
+  int loaded_count = 0;
   while ((n = getline(&line, &cap, f)) >= 0) {
     line_no++;
     while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
@@ -3422,9 +3470,15 @@ static void load_config(void) {
     }
 
     bindings[act] = kb;
+    loaded_count++;
   }
   free(line);
   fclose(f);
+
+  if (loaded_count > 0) {
+    fprintf(stderr, "terminator: loaded %d custom keybinding(s) from %s\n",
+            loaded_count, path);
+  }
 }
 
 /* ---- Task 10: Tab filename auto-completion ---- */
@@ -3568,9 +3622,8 @@ static int is_bar_line(const char *line) {
 }
 
 static void parse_bar_line(const char *line, char *cwd, size_t cwd_sz,
-                           char *branch, size_t branch_sz,
-                           char *dur_str, size_t dur_sz,
-                           char *time_str, size_t time_sz,
+                           char *branch, size_t branch_sz, char *dur_str,
+                           size_t dur_sz, char *time_str, size_t time_sz,
                            int *right_is_err) {
   cwd[0] = '\0';
   branch[0] = '\0';
@@ -3634,9 +3687,8 @@ static void parse_bar_line(const char *line, char *cwd, size_t cwd_sz,
 }
 
 static void get_current_bar_info(Tab *cur, char *abbrev_cwd, size_t cwd_sz,
-                                 char *branch, size_t branch_sz,
-                                 char *dur_str, size_t dur_sz,
-                                 char *time_str, size_t time_sz,
+                                 char *branch, size_t branch_sz, char *dur_str,
+                                 size_t dur_sz, char *time_str, size_t time_sz,
                                  int *right_is_err) {
   abbreviate_path(cur->cwd, abbrev_cwd, cwd_sz);
   if (!get_git_branch(cur->cwd, branch, branch_sz)) {
@@ -3678,14 +3730,14 @@ static void get_current_bar_info(Tab *cur, char *abbrev_cwd, size_t cwd_sz,
   }
 }
 
-static void draw_status_bar(int draw_y, const char *abbrev_cwd, const char *branch,
-                            const char *dur_str, const char *time_str,
-                            int right_is_err, int win_w) {
+static void draw_status_bar(int draw_y, const char *abbrev_cwd,
+                            const char *branch, const char *dur_str,
+                            const char *time_str, int right_is_err, int win_w) {
   int has_branch = (branch && branch[0] != '\0');
   int left_chars =
       (int)strlen(abbrev_cwd) + (has_branch ? (6 + (int)strlen(branch)) : 0);
-  int right_chars =
-      (dur_str && dur_str[0] ? ((int)strlen(dur_str) + 6) : 3) + (int)strlen(time_str);
+  int right_chars = (dur_str && dur_str[0] ? ((int)strlen(dur_str) + 6) : 3) +
+                    (int)strlen(time_str);
 
   int pad = 8;
   int left_w = left_chars * char_width + pad * 2;
@@ -3913,10 +3965,9 @@ static int is_valid_command(const char *cmd, const char *cwd) {
     return 0;
 
   static const char *const builtins[] = {
-      "cd",      "exit",   "source", ".",          "export", "history",
-      "jobs",    "fg",     "bg",     "[",          "test",   "multiWatch",
-      "multiwatch", "bash","sh",     "if",         "then",   "elif",
-      "else",    "fi",     NULL};
+      "cd", "exit", "source", ".",    "export",     "history",    "jobs",
+      "fg", "bg",   "[",      "test", "multiWatch", "multiwatch", "bash",
+      "sh", "if",   "then",   "elif", "else",       "fi",         NULL};
   for (int i = 0; builtins[i]; i++) {
     if (strcmp(cmd, builtins[i]) == 0)
       return 1;
@@ -3955,12 +4006,12 @@ static int is_valid_command(const char *cmd, const char *cwd) {
     return 0;
   }
 
-  /* Cache the last looked-up command name to avoid scanning PATH on every frame */
+  /* Cache the last looked-up command name to avoid scanning PATH on every frame
+   */
   static char cached_cmd[256] = "";
   static char cached_cwd[PATH_MAX] = "";
   static int cached_res = 0;
-  if (strcmp(cmd, cached_cmd) == 0 &&
-      strcmp(cwd ? cwd : "", cached_cwd) == 0) {
+  if (strcmp(cmd, cached_cmd) == 0 && strcmp(cwd ? cwd : "", cached_cwd) == 0) {
     return cached_res;
   }
 
@@ -4003,7 +4054,8 @@ static int is_valid_command(const char *cmd, const char *cwd) {
   return cached_res;
 }
 
-/* Scan shared_state->history backwards for most recent command starting with prefix */
+/* Scan shared_state->history backwards for most recent command starting with
+ * prefix */
 static int get_ghost_suggestion(const char *input, int input_len, char *suffix,
                                 size_t cap) {
   suffix[0] = '\0';
@@ -4050,8 +4102,8 @@ static void draw_highlighted_input(Tab *cur, int px, int draw_y) {
       wlen = (int)sizeof(word) - 1;
     memcpy(word, s + wstart, (size_t)wlen);
     word[wlen] = '\0';
-    first_word_col = is_valid_command(word, cur->cwd) ? col_prompt_user
-                                                      : col_prompt_arrow;
+    first_word_col =
+        is_valid_command(word, cur->cwd) ? col_prompt_user : col_prompt_arrow;
   }
 
   int in_squote = 0;
@@ -4138,15 +4190,15 @@ static void redraw(int win_w, int win_h) {
   Tab *cur = &tabs[active_tab];
 
   int content_top = TAB_BAR_HEIGHT + 16;
-  int prompt_height =
-      tab_is_busy(active_tab)
-          ? 0
-          : ((cur->pending_len > 0 ? 1 : 2) * char_height + 14);
+  int prompt_height = tab_is_busy(active_tab)
+                          ? 0
+                          : ((cur->pending_len > 0 ? 1 : 2) * char_height + 14);
   int live_avail_h = win_h - content_top - prompt_height;
   if (live_avail_h < char_height)
     live_avail_h = char_height;
 
-  /* 1. Compute live_start: how many lines fit above the prompt at scroll_offset == 0 */
+  /* 1. Compute live_start: how many lines fit above the prompt at scroll_offset
+   * == 0 */
   int live_used_h = 0;
   int live_start = cur->line_count;
   while (live_start > 0) {
@@ -4158,7 +4210,8 @@ static void redraw(int win_w, int win_h) {
     live_start--;
   }
 
-  /* 2. Compute top_fill_end: how many lines from index 0 fill the scroll viewport */
+  /* 2. Compute top_fill_end: how many lines from index 0 fill the scroll
+   * viewport */
   int scroll_avail_h = win_h - content_top - 10;
   if (scroll_avail_h < char_height)
     scroll_avail_h = char_height;
@@ -4166,15 +4219,16 @@ static void redraw(int win_w, int win_h) {
   int top_used_h = 0;
   int top_fill_end = 0;
   while (top_fill_end < cur->line_count) {
-    int lh = is_bar_line(cur->lines[top_fill_end]) ? (char_height + 6)
-                                                   : char_height;
+    int lh =
+        is_bar_line(cur->lines[top_fill_end]) ? (char_height + 6) : char_height;
     if (top_used_h + lh > scroll_avail_h && top_fill_end > 0)
       break;
     top_used_h += lh;
     top_fill_end++;
   }
 
-  /* 3. Determine exact max_scroll so start_line never goes past 0 and bottom never empties */
+  /* 3. Determine exact max_scroll so start_line never goes past 0 and bottom
+   * never empties */
   int max_scroll = 0;
   int use_full_scroll_viewport = 0;
   if (live_start > 0) {
@@ -4233,7 +4287,8 @@ static void redraw(int win_w, int win_h) {
     }
   }
 
-  /* Draw Scrollbar Track & Thumb on the right edge when content exceeds viewport */
+  /* Draw Scrollbar Track & Thumb on the right edge when content exceeds
+   * viewport */
   if (max_scroll > 0) {
     int track_x = win_w - 7;
     int track_y = content_top - font_ascent;
@@ -4295,8 +4350,8 @@ static void redraw(int win_w, int win_h) {
       int cursor_x = spx + cur->search_len * char_width;
 
       XSetForeground(dpy, gc, col_cursor);
-      XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
-                     char_height);
+      XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2,
+                     char_width, char_height);
     } else if (!tab_is_busy(active_tab)) {
       char abbrev_cwd[512];
       abbreviate_path(cur->cwd, abbrev_cwd, sizeof(abbrev_cwd));
@@ -4348,8 +4403,8 @@ static void redraw(int win_w, int win_h) {
       int cursor_x = px + cur->input_pos * char_width;
 
       XSetForeground(dpy, gc, col_cursor);
-      XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2, char_width,
-                     char_height);
+      XFillRectangle(dpy, win, gc, cursor_x, draw_y - font_ascent + 2,
+                     char_width, char_height);
       if (cur->input_pos < cur->input_len) {
         XSetForeground(dpy, gc, col_bg);
         XDrawString(dpy, win, gc, cursor_x, draw_y, &cur->input[cur->input_pos],
@@ -4366,6 +4421,8 @@ int main(int argc, char **argv) {
   /* ./terminator = thread mode, ./terminator useProcess=True = process */
   int headless = 0;
   int print_hist_only = 0;
+  const char *cli_config = NULL;
+
   for (int i = 1; i < argc; i++) {
     if (strncmp(argv[i], "useProcess=", 11) == 0) {
       const char *v = argv[i] + 11;
@@ -4373,8 +4430,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--process") == 0 ||
                strcmp(argv[i], "-p") == 0) {
       use_process_mode = 1;
-    } else if (strcmp(argv[i], "--thread") == 0 ||
-               strcmp(argv[i], "-t") == 0 ||
+    } else if (strcmp(argv[i], "--thread") == 0 || strcmp(argv[i], "-t") == 0 ||
                strcmp(argv[i], "useProcess=False") == 0 ||
                strcmp(argv[i], "useProcess=0") == 0) {
       use_process_mode = 0;
@@ -4382,13 +4438,20 @@ int main(int argc, char **argv) {
       headless = 1;
     } else if (strcmp(argv[i], "--history") == 0) {
       print_hist_only = 1;
+    } else if (strcmp(argv[i], "--rc") == 0 || strcmp(argv[i], "--config") == 0 ||
+               strcmp(argv[i], "-c") == 0) {
+      if (i + 1 < argc)
+        cli_config = argv[++i];
+    } else if (strstr(argv[i], "terminatorrc") != NULL) {
+      cli_config = argv[i];
     } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      printf("Usage: %s [OPTIONS]\n\n"
+      printf("Usage: %s [OPTIONS] [CONFIG_FILE]\n\n"
              "Launch Modes:\n"
              "  (default) | --thread | useProcess=False   Launch GUI with each tab as a POSIX thread\n"
              "  --process | -p       | useProcess=True    Launch GUI with each tab as a forked child process\n"
              "  --shell                                   Run shell engine on stdin/stdout (headless mode)\n"
              "  --history                                 Print shared command history across all tabs\n"
+             "  --config | --rc | -c <file>               Load custom keybindings from specified file\n"
              "  --help    | -h                            Show this help message\n",
              argv[0]);
       return 0;
@@ -4403,7 +4466,7 @@ int main(int argc, char **argv) {
 
   history_init_path();
   history_load();
-  load_config();
+  load_config(cli_config);
 
   if (print_hist_only) {
     print_history(STDOUT_FILENO);
@@ -4609,7 +4672,8 @@ int main(int argc, char **argv) {
             /* Mouse wheel UP: scroll back into history */
             cur->scroll_offset += 3;
             if (cur->scroll_offset > cur->line_count - 1)
-              cur->scroll_offset = cur->line_count > 0 ? cur->line_count - 1 : 0;
+              cur->scroll_offset =
+                  cur->line_count > 0 ? cur->line_count - 1 : 0;
             redraw(win_w, win_h);
           } else if (ev.xbutton.button == 5) {
             /* Mouse wheel DOWN: scroll forward toward live stream */
@@ -4627,7 +4691,13 @@ int main(int argc, char **argv) {
         char kbuf[32];
         int len = XLookupString(&ev.xkey, kbuf, sizeof(kbuf) - 1, &ks, NULL);
         Tab *cur = &tabs[active_tab];
-        unsigned int mod = ev.xkey.state & (ControlMask | ShiftMask | Mod1Mask);
+        unsigned int mod = 0;
+        if (ev.xkey.state & ControlMask)
+          mod |= ControlMask;
+        if (ev.xkey.state & ShiftMask)
+          mod |= ShiftMask;
+        if (ev.xkey.state & (Mod1Mask | Mod4Mask | Mod5Mask))
+          mod |= Mod1Mask;
 
         KeySym norm_ks = ks;
         if (norm_ks >= XK_A && norm_ks <= XK_Z)
@@ -4653,7 +4723,8 @@ int main(int argc, char **argv) {
           if (action == ACT_SCROLL_UP) {
             cur->scroll_offset += 10;
             if (cur->scroll_offset > cur->line_count - 1)
-              cur->scroll_offset = cur->line_count > 0 ? cur->line_count - 1 : 0;
+              cur->scroll_offset =
+                  cur->line_count > 0 ? cur->line_count - 1 : 0;
             redraw(win_w, win_h);
             continue;
           } else if (action == ACT_SCROLL_DOWN) {
@@ -4681,8 +4752,8 @@ int main(int argc, char **argv) {
               localtime_r(&now, &tm_i);
               shared_lock();
               strftime(shared_state->last_time[cur->slot],
-                       sizeof(shared_state->last_time[cur->slot]), "%I:%M:%S %p",
-                       &tm_i);
+                       sizeof(shared_state->last_time[cur->slot]),
+                       "%I:%M:%S %p", &tm_i);
               shared_unlock();
             }
             cur->input_len = 0;
@@ -4782,7 +4853,8 @@ int main(int argc, char **argv) {
           case ACT_SCROLL_UP:
             cur->scroll_offset += 10;
             if (cur->scroll_offset > cur->line_count - 1)
-              cur->scroll_offset = cur->line_count > 0 ? cur->line_count - 1 : 0;
+              cur->scroll_offset =
+                  cur->line_count > 0 ? cur->line_count - 1 : 0;
             redraw(win_w, win_h);
             break;
           case ACT_SCROLL_DOWN:
@@ -4826,8 +4898,8 @@ int main(int argc, char **argv) {
               localtime_r(&now, &tm_i);
               shared_lock();
               strftime(shared_state->last_time[cur->slot],
-                       sizeof(shared_state->last_time[cur->slot]), "%I:%M:%S %p",
-                       &tm_i);
+                       sizeof(shared_state->last_time[cur->slot]),
+                       "%I:%M:%S %p", &tm_i);
               shared_unlock();
             }
             redraw(win_w, win_h);
@@ -5040,8 +5112,8 @@ int main(int argc, char **argv) {
                 snprintf(echo_line, sizeof(echo_line), "%s%s\n", CONT_PROMPT,
                          cur->input);
               } else {
-                snprintf(echo_line, sizeof(echo_line),
-                         "user@terminator> %s\n", cur->input);
+                snprintf(echo_line, sizeof(echo_line), "user@terminator> %s\n",
+                         cur->input);
               }
               tab_append_text(cur, echo_line, strlen(echo_line));
 
@@ -5069,7 +5141,8 @@ int main(int argc, char **argv) {
                   cur->pending_len += cur->input_len;
                   if (input_status(cur->pending) == INPUT_COMPLETE) {
                     cur->pending_len = 0;
-                    if (shared_state && cur->slot >= 0 && cur->slot < MAX_TABS) {
+                    if (shared_state && cur->slot >= 0 &&
+                        cur->slot < MAX_TABS) {
                       __atomic_store_n(&shared_state->busy[cur->slot], 1,
                                        __ATOMIC_SEQ_CST);
                     }
