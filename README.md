@@ -66,42 +66,73 @@ For deep-dive architectural diagrams, state transition graphs, and data structur
 ### Starship-Style Status Bar & Live Syntax Highlighting
 Renders active Git branch, path abbreviation, command duration, and real-time syntax coloring:
 
-```text
-+---------------------------------------------------------------------------------------+
-| 1: tab  |  +                                                                          |
-|---------------------------------------------------------------------------------------|
-|  ~/Desktop/terminal_demo | on main --------------------- took 12ms | at 03:45:10 PM   |
-|  user@terminator> ls -la                                                              |
-+---------------------------------------------------------------------------------------+
-```
-*(Insert screenshots here, e.g., `![Status Bar](docs/screenshots/status_bar.png)`)*
+<img width="806" height="85" alt="Screenshot 2026-11-03 at 4 08 46 PM" src="https://github.com/user-attachments/assets/e9ef4f4e-ab5b-4ff9-b19c-03e91f87c0a4" />
+
 
 ### Multi-Tab Workspace & Smooth Scrollback
 Demonstrates concurrent tabs, background unread badges, mouse wheel scrollback, and floating indicator badge (`[+ N lines]`):
 
-```text
-+---------------------------------------------------------------------------------------+
-| 1: tab  | 2: tab [•] |  +                                               [+ 10 lines]  |
-|---------------------------------------------------------------------------------------|
-|  [Historical command output and preserved scrollback status bars]                     |
-|                                                                                       |
-+---------------------------------------------------------------------------------------+
-```
-*(Insert screenshots here, e.g., `![Scrollback and Tabs](docs/screenshots/tabs_scroll.png)`)*
+<img width="824" height="228" alt="Screenshot 2026-11-03 at 4 10 27 PM" src="https://github.com/user-attachments/assets/7d86f954-1e10-4833-b4db-07e922013f0d" />
 
 ### Parallel Multi-Command Monitor (`multiWatch`)
 Timestamped concurrent execution of multiple shell pipelines:
 
-```text
-+---------------------------------------------------------------------------------------+
-|  user@terminator> multiWatch ["date +%T", "ls | wc -l"]                               |
-|  "date +%T", 1790860020:                                                              |
-|  ----------------------------------------------------                                 |
-|  18:37:00                                                                             |
-|  ----------------------------------------------------                                 |
-+---------------------------------------------------------------------------------------+
-```
-*(Insert screenshots here, e.g., `![multiWatch](docs/screenshots/multiwatch.png)`)*
+<img width="825" height="546" alt="Screenshot 2026-11-03 at 4 12 46 PM" src="https://github.com/user-attachments/assets/5346c573-7264-49ad-9fd7-4edba4e0fb11" />
+
+### Signal Handling & Job Control
+Demonstrates no-TTY process-group signal routing (`Ctrl+C` interrupt, `Ctrl+Z` suspension) and background job control (`jobs`, `bg`, `fg`):
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Interactive Reverse History Search (`Ctrl+R`)
+Recalls past commands from the 10,000-entry shared persistent history using exact and substring matching:
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Typo Correction Engine ("Did You Mean?")
+Fuzzy matching based on Damerau-Levenshtein edit distance for mistyped commands and CLI subcommands:
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Tab Filename Auto-Completion & Candidate Menu
+Directory-aware filename expansion with longest common prefix (LCP) completion and numbered selection menus:
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Fish-Style Ghost Autosuggestions
+Renders dimmed historical command completions ahead of the cursor with one-key Right Arrow (`->`) acceptance:
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Multiline Input & Continuation Prompt (`> `)
+Accumulates incomplete expressions (unclosed quotes, trailing backslashes, open subshells) with continuation prompts:
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Native Shell Scripting & Control Flow
+Executes `.sh` scripts natively with variables, nested `if / elif / else / fi` blocks, and `[` test evaluations:
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Multi-Stage Pipelines & I/O Redirection
+Chains arbitrary commands across Unix pipes (`|`) with unified process groups and file descriptor redirections (`<`, `>`, `>>`):
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Background Tab Activity Badges & Audio Alerts
+Displays unread notification dots on hidden background tabs and triggers an audible bell (`XBell`) upon job completion:
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Process Mode Fault Isolation (`--process` / `useProcess=True`)
+Runs tabs in isolated forked processes synchronized via POSIX shared memory (`mmap`) and named semaphores (`sem_open`):
+
+*(Insert screenshot here, e.g., `<img ... />`)*
+
+### Runtime Keybinding Customization (`~/.terminatorrc`)
+Reconfigures hotkeys on the fly without recompilation via custom configuration files:
+
+*(Insert screenshot here, e.g., `<img ... />`)*
 
 ---
 
@@ -110,7 +141,6 @@ Timestamped concurrent execution of multiple shell pipelines:
 Watch the complete feature walkthrough and live presentation of Terminator in action:
 
 - **Live Demonstration Video:** [Watch Video Demonstration](https://youtu.be/placeholder) *(Replace with your video link or local embed)*
-- **Demo Script & Talk Track:** Follow along with the verbatim 5-minute presentation script in [assignment/LIVE_DEMO_5MIN.md](assignment/LIVE_DEMO_5MIN.md) and the comprehensive test checklist in [assignment/demo.txt](assignment/demo.txt).
 
 ---
 
@@ -147,7 +177,7 @@ Watch the complete feature walkthrough and live presentation of Terminator in ac
 
 ## 7. Use Cases
 
-1. **Systems Programming & OS Education:** Demonstrates practical POSIX kernel interfaces—process groups, signals without a TTY, anonymous/named shared memory, semaphores, thread-local state, and non-blocking I/O multiplexing—in a single readable codebase.
+1. **Systems Programming & OS Education:** Demonstrates practical POSIX kernel interfaces -- process groups, signals without a TTY, anonymous/named shared memory, semaphores, thread-local state, and non-blocking I/O multiplexing -- in a single readable codebase.
 2. **Real-Time Multi-Stream Monitoring:** Using `multiWatch`, developers can monitor multiple log files, system metrics, or build directories simultaneously inside one tab with timestamped output blocks.
 3. **Fault-Isolated Command Execution:** Running in Process Mode (`--process`) ensures that experimental workloads or crashes in one tab are completely isolated at the OS process level from the GUI and sibling tabs.
 4. **Automated Headless Testing & CI Pipelines:** Using `--shell`, the command engine can execute scripts and complex pipelines in headless environments or automated grading harnesses without requiring an X11 server.

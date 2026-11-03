@@ -1,6 +1,6 @@
 # Terminator: System Design & Architecture Document
 
-> **Course:** CS69201 · Computing Lab · Term Project  
+> **Course:** CS69201 - Computing Lab - Term Project  
 > **Institution:** Department of Computer Science and Engineering, Indian Institute of Technology Kharagpur  
 > **Author:** Niranjan Hebli
 
@@ -563,7 +563,7 @@ flowchart TD
 
 ### 7.2 Keybinding Engine & `~/.terminatorrc`
 Default bindings conform to standard readline:
-- Navigation: `←` / `→` (character), `Ctrl+A` (home), `Ctrl+E` (end)
+- Navigation: `Left` / `Right` (character), `Ctrl+A` (home), `Ctrl+E` (end)
 - Editing: `Ctrl+W` (delete word), `Ctrl+U` (delete to start), `Ctrl+K` (delete to end), `Ctrl+L` (clear screen)
 - Tabs & Clipboard: `Ctrl+T` (new tab), `Ctrl+D` (close tab / EOF), `Ctrl+Shift+C` (copy), `Ctrl+Shift+V` (paste)
 
@@ -669,7 +669,7 @@ Terminator features real-time interactive input feedback directly in the X11 gra
 - **Real-Time Command Highlighting:** As characters are typed into the input buffer, `is_valid_command()` inspects the initial command token. Recognized built-ins, scripts, and binaries discovered in `$PATH` are drawn in green (`#a6e3a1`), while unrecognized tokens are drawn in red/pink (`#f38ba8`).
 - **Quote Syntax Highlighting:** Single-quoted (`'...'`) and double-quoted (`"..."`) strings are styled dynamically in peach (`#fab387`).
 - **Fish-Style Ghost Autosuggestions:** `get_ghost_suggestion()` queries persistent history for the latest matching prefix. The suggested command tail is drawn inline ahead of the cursor in dimmed text (`#6c7086`).
-- **One-Key Acceptance:** Pressing the Right Arrow (`→`) key at the end of the line accepts the ghost suggestion immediately into the active input line.
+- **One-Key Acceptance:** Pressing the Right Arrow (`->`) key at the end of the line accepts the ghost suggestion immediately into the active input line.
 
 ---
 
@@ -727,7 +727,7 @@ sequenceDiagram
     participant Display as X11 Display
     participant Shell as Shell Engine
 
-    Note over Display: Active prompt: [~/path | on main --- took 1s | at 12:00]\nuser@terminator> █
+    Note over Display: Active prompt: [~/path | on main --- took 1s | at 12:00]\nuser@terminator>
     User->>Display: Types "ls" and presses Enter (XK_Return)
     Display->>Buffer: append_status_bar_line(cur)
     Display->>Buffer: append "user@terminator> ls\n"
@@ -735,7 +735,7 @@ sequenceDiagram
     Shell->>Shell: Execute command (fork + execvp)
     Shell->>Buffer: Streams output ("Makefile", "README.md", ...)
     Shell->>Shell: Command finishes -> monotonic clock computes elapsed_ms
-    Note over Display: redraw() renders:\n1. All historical lines in buffer (including previous status bars)\n2. New active status bar [~/path | on main --- took 8ms | at 12:00]\n3. New prompt: user@terminator> █
+    Note over Display: redraw() renders:\n1. All historical lines in buffer (including previous status bars)\n2. New active status bar [~/path | on main --- took 8ms | at 12:00]\n3. New prompt: user@terminator>
 ```
 
 ### 8.3 Native Smooth Scrollback & Mouse Wheel Support

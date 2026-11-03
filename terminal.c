@@ -3130,17 +3130,6 @@ static void create_tab(void) {
   t->line_count = 0;
   t->scroll_offset = 0;
 
-  char welcome[128];
-  if (use_process_mode) {
-    snprintf(welcome, sizeof(welcome),
-             "Terminator Tab %d (process mode, PID: %d ready)\n", t->id,
-             (int)pid);
-  } else {
-    snprintf(welcome, sizeof(welcome),
-             "Terminator Tab %d (thread mode ready)\n", t->id);
-  }
-  tab_append_text(t, welcome, strlen(welcome));
-
   active_tab = tab_count;
   tab_count++;
 }
