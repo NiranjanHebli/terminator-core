@@ -1,4 +1,4 @@
-# Terminator Demo
+# Terminator: Custom X11 Terminal Emulator & POSIX Shell
 
 [![C11](https://img.shields.io/badge/Language-C11-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C11_(C_standard_revision))
 [![X11](https://img.shields.io/badge/GUI-X11%20%2F%20Xlib-CC292B)](https://www.x.org/)
@@ -7,79 +7,208 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey?logo=apple&logoColor=white)](https://github.com/)
 [![Build](https://img.shields.io/badge/Build-Makefile-008080?logo=gnu&logoColor=white)](Makefile)
 
-A custom X11 terminal emulator and command shell built from scratch in C using Xlib and POSIX system calls.
+A custom X11 graphical terminal emulator and command shell built from scratch in C11 using raw Xlib graphics and POSIX system calls.
 
 ---
 
-## Prerequisites
+## Table of Contents
 
-- **macOS:** [XQuartz](https://www.xquartz.org/) and `libx11` via Homebrew:
+1. [Background](#1-background)
+2. [Technology Stack](#2-technology-stack)
+3. [System Architecture](#3-system-architecture)
+4. [Screenshots](#4-screenshots)
+5. [Demo Video](#5-demo-video)
+6. [Features](#6-features)
+7. [Use Cases](#7-use-cases)
+8. [Prerequisites & Installation](#8-prerequisites--installation)
+9. [Quick Start & Execution Modes](#9-quick-start--execution-modes)
+10. [Interactive Demo Commands](#10-interactive-demo-commands)
+11. [Keybindings & Configuration](#11-keybindings--configuration)
+12. [Known Limitations & Future Scope](#12-known-limitations--future-scope)
+
+---
+
+## 1. Background
+
+In modern Unix systems, a terminal session involves two distinct components: a **graphical terminal emulator** (which manages windows, fonts, scrollback buffers, and keyboard/mouse events) and a **command-line shell** (which parses commands, expands variables, wires pipelines, and manages process groups). Normally, these two layers communicate through a kernel pseudo-terminal (`pty`) driver.
+
+**Terminator** unifies both systems into a single cohesive architecture built from the ground up without high-level GUI toolkits (no GTK, Qt, or ncurses) and without delegating command execution to `/bin/sh` or `/bin/bash`. Because there is no kernel `pty` line discipline between the GUI and the shell, Terminator implements its own non-blocking `poll()` event multiplexer, inter-process pipe plumbing, process group management, and signal delivery subsystem directly in C.
+
+Furthermore, Terminator is designed as a dual-concurrency system: it can run every terminal tab either as a lightweight **POSIX thread (`pthread`)** sharing heap memory or as an isolated **forked child process (`fork`)** synchronizing state across process boundaries via **POSIX shared memory (`shm_open` / `mmap`)** and **named semaphores (`sem_open`)**.
+
+---
+
+## 2. Technology Stack
+
+| Layer | Technology / API | Purpose |
+| :--- | :--- | :--- |
+| **Core Language** | C11 (`-std=c11 -Wall -Wextra`) | Low-level systems programming, memory management, and atomic operations (`_Atomic`) |
+| **Windowing & Graphics** | X11 / Xlib (`<X11/Xlib.h>`, `<X11/Xutil.h>`) | Window creation, custom Catppuccin rendering, font metrics, keyboard and mouse wheel event handling |
+| **I/O Multiplexing** | POSIX `poll()` (`<poll.h>`) | Zero-spin sleeping event loop monitoring the X11 socket and all tab output pipes simultaneously |
+| **Concurrency (Mode 1)** | POSIX Threads (`<pthread.h>`) | Multi-threaded tab workers (`pthread_create`), thread-local storage (`_Thread_local`), and recursive mutexes |
+| **Concurrency (Mode 2)** | Process Management (`<unistd.h>`, `<sys/wait.h>`) | Multi-process tab isolation (`fork`, `execvp`, `waitpid`, `setpgid`) |
+| **Shared Memory & IPC** | POSIX IPC (`<sys/mman.h>`, `<semaphore.h>`) | Cross-process state sharing (`shm_open`, `ftruncate`, `mmap`) and synchronization (`sem_open`, `sem_wait`, `sem_post`) |
+| **Signal Subsystem** | POSIX Signals (`<signal.h>`) | Custom no-TTY signal routing (`kill(-pgid, sig)`, `sigaction`, `SIGINT`, `SIGTSTP`, `SIGCONT`) |
+| **Build System** | GNU Make ([Makefile](Makefile)) | Automated OS detection (macOS XQuartz vs. Linux X11) and compiler flag configuration |
+
+---
+
+## 3. System Architecture
+
+Terminator strictly decouples the **X11 GUI Frontend** from the **Shell Execution Engine**. Each tab communicates with the GUI strictly over unidirectional Unix pipes (`in_fd` and `out_fd`), allowing the exact same shell engine to power Thread Mode, Process Mode, and Headless CLI Mode (`--shell`).
+
+For deep-dive architectural diagrams, state transition graphs, and data structure layouts, see the [System Design Document (docs/DESIGN.md)](docs/DESIGN.md).
+
+---
+
+## 4. Screenshots
+
+### Starship-Style Status Bar & Live Syntax Highlighting
+Renders active Git branch, path abbreviation, command duration, and real-time syntax coloring:
+
+```text
++---------------------------------------------------------------------------------------+
+| 1: tab  |  +                                                                          |
+|---------------------------------------------------------------------------------------|
+|  ~/Desktop/terminal_demo | on main --------------------- took 12ms | at 03:45:10 PM   |
+|  user@terminator> ls -la                                                              |
++---------------------------------------------------------------------------------------+
+```
+*(Insert screenshots here, e.g., `![Status Bar](docs/screenshots/status_bar.png)`)*
+
+### Multi-Tab Workspace & Smooth Scrollback
+Demonstrates concurrent tabs, background unread badges, mouse wheel scrollback, and floating indicator badge (`[+ N lines]`):
+
+```text
++---------------------------------------------------------------------------------------+
+| 1: tab  | 2: tab [•] |  +                                               [+ 10 lines]  |
+|---------------------------------------------------------------------------------------|
+|  [Historical command output and preserved scrollback status bars]                     |
+|                                                                                       |
++---------------------------------------------------------------------------------------+
+```
+*(Insert screenshots here, e.g., `![Scrollback and Tabs](docs/screenshots/tabs_scroll.png)`)*
+
+### Parallel Multi-Command Monitor (`multiWatch`)
+Timestamped concurrent execution of multiple shell pipelines:
+
+```text
++---------------------------------------------------------------------------------------+
+|  user@terminator> multiWatch ["date +%T", "ls | wc -l"]                               |
+|  "date +%T", 1790860020:                                                              |
+|  ----------------------------------------------------                                 |
+|  18:37:00                                                                             |
+|  ----------------------------------------------------                                 |
++---------------------------------------------------------------------------------------+
+```
+*(Insert screenshots here, e.g., `![multiWatch](docs/screenshots/multiwatch.png)`)*
+
+---
+
+## 5. Demo Video
+
+Watch the complete feature walkthrough and live presentation of Terminator in action:
+
+- **Live Demonstration Video:** [Watch Video Demonstration](https://youtu.be/placeholder) *(Replace with your video link or local embed)*
+- **Demo Script & Talk Track:** Follow along with the verbatim 5-minute presentation script in [assignment/LIVE_DEMO_5MIN.md](assignment/LIVE_DEMO_5MIN.md) and the comprehensive test checklist in [assignment/demo.txt](assignment/demo.txt).
+
+---
+
+## 6. Features
+
+### 6.1 Graphical Terminal Interface & UX
+- **Catppuccin Mocha Theme & Starship Status Bar:** Renders a two-pill status bar above every prompt showing the abbreviated working directory (`~/path`), active Git branch (`| on main`), execution duration (`took 12ms`), exit status/interrupt badges (`ERR` / `INT`), and completion timestamp (`at 03:45:10 PM`).
+- **Multi-Tab Workspace:** Create up to 16 concurrent tabs (`Ctrl+T` or click `+`), switch tabs via mouse click, and close individual tabs (`exit` or `Ctrl+D`) without affecting other sessions.
+- **Native Smooth Scrollback & Mouse Wheel Support:** Browse up to 1,000 lines of historical output (including preserved historical status bars) per tab using the mouse wheel (`Button4`/`Button5`) or `Shift+PageUp`/`Shift+PageDown`, complete with a proportional scrollbar thumb and a `[+ N lines]` indicator badge in the tab header.
+- **Live Syntax Highlighting & Fish-Style Ghost Autosuggestions:** Highlights valid commands in green, unrecognized commands in red, and quoted strings in peach as you type. Suggests matching historical commands inline in dimmed text ahead of the cursor (accept with `Right Arrow`).
+- **Background Tab Activity Badges & Bell:** Displays an unread notification dot on background tabs and rings the X11 bell (`XBell`) when hidden jobs produce output or finish running.
+
+### 6.2 Shell Execution, Quoting & Plumbing
+- **External Commands & Built-ins:** Full `fork()` -> `execvp()` -> `waitpid()` lifecycle alongside built-in commands (`cd`, `exit`, `jobs`, `fg`, `bg`, `history`, `multiWatch`, `source`, `[`).
+- **Multiline Input, Quoting & Expansion:** Supports single quotes (`'...'`), double quotes (`"..."`), backslash escaping (`\`), variable expansion (`$VAR`, `${VAR}`, `$?`, `$$`), and recursive nested command substitution (`$(...)`). Incomplete lines automatically prompt with `> `.
+- **I/O Redirection (`<`, `>`, `>>`):** Rewires file descriptors in forked child processes using `open()` and `dup2()` without mutating parent shell descriptors.
+- **Multi-Stage Pipelines (`cmd1 | cmd2 | ... | cmdN`):** Chains arbitrary-length pipelines across $N-1$ Unix pipe pairs, aligns all stages into a single process group (`setpgid`), closes unused descriptors to guarantee clean `EOF` propagation, and records the final stage's exit code in `$?`.
+
+### 6.3 Dual Concurrency & Parallel Execution
+- **Thread Mode vs. Process Mode:** Switch seamlessly at launch between single-process `pthread` tabs (`./terminator --thread`) and fault-isolated `fork` tabs (`./terminator --process`) backed by `mmap` shared memory.
+- **Parallel Multi-Command Monitor (`multiWatch`):** Executes multiple commands or pipelines in parallel (`multiWatch ["cmd1", "cmd2", ...]`), multiplexing live output streams via `poll()` with real-time timestamps until interrupted via `Ctrl+C`.
+
+### 6.4 No-TTY Signal Handling & Job Control
+- **Process Group Signal Routing:** Because there is no kernel `pty` to translate keystrokes into signals, the GUI intercepts `Ctrl+C` and `Ctrl+Z`, looks up the active tab's atomic foreground process group (`fg_pgid`), and dispatches `SIGINT` or `SIGTSTP` to `-pgid`.
+- **Interactive Job Management:** Supports background execution (`cmd &` with `/dev/null` stdin redirection), job listing (`jobs`), foreground resumption (`fg %n`), and background resumption (`bg %n`).
+
+### 6.5 Bash-Style Productivity & Scripting
+- **Persistent Shared History & Reverse Search (`Ctrl+R`):** Persists 10,000 commands across restarts in `~/.terminator_history`, synchronized immediately across all tabs. Includes `Ctrl+R` reverse search with exact and longest-common-substring (>2 chars) matching.
+- **Interactive Tab Filename Completion:** Completes unique filenames inline on `Tab`, or expands to the Longest Common Prefix (LCP) and presents an interactive numbered selection menu (`1..9`) when multiple files match.
+- **Native Shell Scripting Engine:** Executes `.sh` scripts natively (`./check.sh`, `bash script.sh`, `source script.sh`) with positional arguments (`$1`..`$9`, `$#`), local variables, nested `if / elif / else / fi` control flow, and `[` test evaluations (`-f`, `-d`, `-e`, `=`, `!=`, `-eq`, `-lt`, etc.).
+- **"Did You Mean?" Typo Suggestion Engine:** Uses Damerau-Levenshtein edit distance to suggest corrections for mistyped commands (`sl` -> `ls`) and subcommands (`git cmmit` -> `git commit`).
+
+---
+
+## 7. Use Cases
+
+1. **Systems Programming & OS Education:** Demonstrates practical POSIX kernel interfaces—process groups, signals without a TTY, anonymous/named shared memory, semaphores, thread-local state, and non-blocking I/O multiplexing—in a single readable codebase.
+2. **Real-Time Multi-Stream Monitoring:** Using `multiWatch`, developers can monitor multiple log files, system metrics, or build directories simultaneously inside one tab with timestamped output blocks.
+3. **Fault-Isolated Command Execution:** Running in Process Mode (`--process`) ensures that experimental workloads or crashes in one tab are completely isolated at the OS process level from the GUI and sibling tabs.
+4. **Automated Headless Testing & CI Pipelines:** Using `--shell`, the command engine can execute scripts and complex pipelines in headless environments or automated grading harnesses without requiring an X11 server.
+
+---
+
+## 8. Prerequisites & Installation
+
+### System Requirements
+- **macOS:** Install [XQuartz](https://www.xquartz.org/) and `libx11` via Homebrew:
   ```bash
   brew install libx11
   open -a XQuartz
   export DISPLAY=:0
   ```
-- **Linux:** X11 development headers:
+- **Linux (Ubuntu / Debian):** Install X11 development headers:
   ```bash
-  sudo apt-get install -y libx11-dev
+  sudo apt-get update && sudo apt-get install -y build-essential libx11-dev
   ```
 
----
-
-## Build
-
-Build using [Makefile](Makefile):
-
+### Building from Source
+Compile the binary using [Makefile](Makefile):
 ```bash
 make
 ```
-
-The binary is named `terminator`. To clean the compiled binary:
-
+To remove compiled artifacts:
 ```bash
 make clean
 ```
 
 ---
 
-## Documentation
-
-- **System Design Document:** Detailed architecture, concurrency models, synchronization, data structures, IPC, and signals: [docs/DESIGN.md](docs/DESIGN.md).
-
----
-
-## Quick Start & Running Terminator
-
-Terminator provides two execution architectures presenting identical behaviors, as well as CLI utilities for headless mode and cross-tab history:
+## 9. Quick Start & Execution Modes
 
 ```bash
-# Thread Mode (each tab runs as a POSIX thread in a single process):
+# 1. Default Thread Mode (each tab runs as a POSIX thread in a single process):
 ./terminator
 ./terminator --thread            # (or -t / useProcess=False)
 
-# Process Mode (each tab runs as an isolated forked child process):
+# 2. Process Mode (each tab runs as an isolated forked child process):
 ./terminator --process           # (or -p / useProcess=True)
 
-# Headless Shell Mode (interactive TTY prompt or non-interactive piped stdin/stdout, no X11):
+# 3. Headless Shell Mode (runs only the shell engine on stdin/stdout, no X11):
 ./terminator --shell
 
-# Shared History & Help:
-./terminator --history           # Print shared command history across all tabs to stdout
-./terminator --help              # Show all launch options
+# 4. Shared History & CLI Help:
+./terminator --history           # Print shared command history across all tabs
+./terminator --help              # Display launch options
 ```
 
 ---
 
-## Quick Demo Commands
+## 10. Interactive Demo Commands
 
-### 1. Test Script Execution
-Run the bundled test script [check.sh](check.sh) natively inside Terminator:
+### 1. Native Shell Script Execution
 ```bash
 ./check.sh terminal.c            # Tests [ -f ] true branch: reports file exists
 ./check.sh missing_file.c        # Tests [ -f ] false branch: reports missing file
 ```
 
-### 2. Multi-Stage Pipelines & Redirection
+### 2. Multi-Stage Pipelines, Redirection & Substitution
 ```bash
 ls -la | grep "terminal" > out.txt
 cat < out.txt | wc -l
@@ -89,189 +218,68 @@ echo "Files in $(basename $(pwd)): $(ls | wc -l)"
 ### 3. Parallel Live Command Monitor (`multiWatch`)
 ```bash
 multiWatch ["date +%T", "ls | wc -l"]
-# Press Ctrl+C to stop all parallel jobs and return cleanly to prompt
+# Press Ctrl+C to stop all parallel jobs and return cleanly to the prompt
 ```
 
-### 4. No-TTY Signal Delivery & Job Control
+### 4. Signal Delivery & Job Control
 ```bash
 sleep 100 &                      # Starts in background: prints [1] <pid>
 jobs                             # Lists running and stopped jobs
 fg %1                            # Brings job 1 to foreground
-# Press Ctrl+Z to stop foreground job: prints [1]+ Stopped sleep 100
+# Press Ctrl+Z to suspend foreground job: prints [1]+ Stopped sleep 100
 bg %1                            # Resumes job in background: prints [1]+ sleep 100 &
-# Press Ctrl+C to interrupt active foreground job
 ```
 
-### 5. Interactive Reverse History Search (`Ctrl+R`)
-Press `Ctrl+R` to prompt:
-```text
-Enter search term: sleep
-```
-Returns the most recent match, longest common substring (>2 characters), or `No match for search term in history`.
+### 5. Reverse History Search (`Ctrl+R`) & Auto-Completion (`Tab`)
+- Press `Ctrl+R` and type a search query (e.g., `sleep`) to recall matching commands.
+- Type `./check.sh ter` and press `Tab` to auto-complete filenames or pick from a numbered candidate list.
 
-### 6. Tab Filename Auto-Completion
-Type a prefix and press `Tab`:
-```text
-./check.sh ter[Tab]              # Expands to ./check.sh terminal.c
-```
-If multiple candidates match, extends to Longest Common Prefix (LCP) and presents a numbered list:
-```text
-1. terminal.c   2. terminator
-# Press 1 or 2 to select
-```
+---
 
-### 7. Custom Keybindings (`~/.terminatorrc`)
-Custom keybindings can be loaded without recompilation:
+## 11. Keybindings & Configuration
+
+### Default Keybindings
+
+| Action | Default Key | Description |
+| :--- | :--- | :--- |
+| **Cursor Movement** | `Left` / `Right` | Move cursor backward / forward (or accept ghost suggestion at EOL) |
+| **Line Bounds** | `Ctrl+A` / `Ctrl+E` | Jump to start / end of input line |
+| **History Navigation** | `Up` / `Down` | Recall previous / next command from shared history |
+| **Reverse Search** | `Ctrl+R` | Search command history interactively |
+| **Delete to Bounds** | `Ctrl+U` / `Ctrl+K` | Delete from cursor to start / end of line |
+| **Delete Word** | `Ctrl+W` | Delete word before cursor |
+| **Clear Screen** | `Ctrl+L` | Clear active tab display buffer |
+| **Close Tab / EOF** | `Ctrl+D` | Close current tab (on empty line) or delete character under cursor |
+| **Clipboard** | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy current input line to / paste from shared clipboard |
+| **New Tab** | `Ctrl+T` | Spawn a new terminal tab |
+| **Job Signals** | `Ctrl+C` / `Ctrl+Z` | Send `SIGINT` (interrupt) / `SIGTSTP` (suspend) to foreground process group |
+| **Scrollback (Keys)** | `Shift+PageUp` / `Shift+PageDown` | Scroll viewport up / down 10 lines through history |
+| **Scrollback (Mouse)** | `Wheel Up` / `Wheel Down` | Scroll viewport up / down 3 lines per tick |
+
+### Custom Keybindings (`~/.terminatorrc`)
+Keybindings can be customized without recompiling by copying [sample.terminatorrc](sample.terminatorrc) to `~/.terminatorrc` (or setting `$TERMINATOR_RC`):
 ```bash
 cp sample.terminatorrc ~/.terminatorrc
+```
+Example configuration rules:
+```text
+bind clear-screen Ctrl+Shift+L
+bind delete-word Alt+Backspace
+bind scroll-up Shift+PageUp
+bind scroll-down Shift+PageDown
 ```
 
 ---
 
-### X11 GUI & Multi-Tab Terminal Foundation
-- Custom X11 window rendered via Xlib with modern Catppuccin Mocha-inspired color scheme.
-- Tab bar with multi-tab management (click `+` or press `Ctrl+T` to create new tabs, click tabs to switch).
-- Multiplexed non-blocking event loop using `poll()` to sleep when idle and handle X11 events and tab pipes concurrently.
-- Per-tab in-memory text buffer and interactive command-line editing with backspace and cursor.
+## 12. Known Limitations & Future Scope
 
-### Command Execution Engine & Built-ins
-- **Command Lifecycle:** Spawns external binaries via `fork()` -> `execvp()` -> `waitpid()`.
-- **Built-in `cd`:** Changes directory with `chdir()` directly inside the tab shell, supporting `cd`, `cd ~`, `cd ..`, and relative/absolute paths.
-- **Built-in `exit`:** Gracefully exits tab process and frees pipe descriptors.
-- **Return Status Tracking (`$?`):** Tracks exit codes of commands and built-ins, expanding `$?` expressions (e.g., `echo $?`).
-- **Standard Error Integration:** Child `stderr` is multiplexed with `stdout`, routing error diagnostics (such as `command not found`) straight to the terminal window.
+### Known Limitations
+- **No Pseudo-Terminal (`pty`) Emulation:** Because communication uses standard Unix pipes rather than a kernel `pty`, full-screen curses applications (`vim`, `htop`, `less`) that require terminal capability queries (`ioctl` / `termios`) are not intended to run inside the graphical window.
+- **Logical Operators & Globbing:** Chained logical operators (`&&`, `||`, `;`), filename wildcard expansion (`*.c`), and descriptor duplication (`2>&1`) are currently omitted by design.
+- **Semaphore Recovery in Process Mode:** If an external signal forcefully terminates a tab process (`SIGKILL`) while it holds the named history semaphore, other tabs waiting on history lock acquisition may block.
 
-### Multiline Input, Quoting & Expansion
-- **Read until complete:** if a line ends with `\`, or leaves a `'...'`, `"..."` or `$(...)` open, the tab shows a `> ` continuation prompt and keeps reading. The same `input_status()` check is used by the shell and the GUI so they never disagree.
-- **Quoting:** `'single'` is fully literal, `"double"` keeps spaces but still expands `$VAR`, `$?` and `$(...)`, and `\` escapes the next character. `|`, `<`, `>` inside quotes are plain text.
-- **Expansion:** `$VAR`, `${VAR}`, `$?`, `$$` and nested `$(...)` (innermost first, run through the same engine in a child process). Unquoted results are word-split; quoted ones are not.
-- Example: `echo "Files in $(basename $(pwd)): $(ls | \` [Enter] `> wc -l)"`.
-- Not supported: backticks, globbing (`*.txt`), `&&`/`;`.
-
-### Plumbing: I/O Redirection & Pipelines
-- **I/O Redirection (`<`, `>`, `>>`):** Rewired in child processes via `open()` and `dup2()` without affecting the shell descriptors. Operators work with or without spaces (`sort<in.txt>out.txt`); a missing target reports `syntax error`, an unopenable file reports the `errno` message and sets `$?` to 1, and a bare `> file` creates/truncates the file.
-- **Headless test mode:** `./terminator --shell` runs only the shell engine on stdin/stdout (no X11), e.g. `printf 'sort < in.txt > out.txt\n' | ./terminator --shell`.
-- **Multi-Stage Pipelines (`cmd1 | cmd2 | ... | cmdN`):** Creates N - 1 pipes for N stages, properly wiring each command's stdout to the next command's stdin.
-- **Pipe Closure Rule:** Unused pipe ends are closed in each child and in the parent shell so readers receive `EOF`.
-- **Process Group Alignment (`setpgid`):** All pipeline children share a process group for unified signal dispatching.
-- **Reaping & Status:** Waits for all pipeline stages and captures the last command's return status in `$?`.
-
-### Multi-Tab Concurrency: Tabs, Shared State & multiWatch
-- **Two execution modes, identical behaviour:**
-  - `./terminator` / `./terminator --thread` (`-t`, `useProcess=False`, default **thread mode**): the process hosts one `pthread` per tab.
-  - `./terminator --process` (`-p`, `useProcess=True`, **process mode**): the GUI is the parent and each tab is a `fork()`ed child process.
-  - In both modes a tab talks to the GUI through a pair of pipes, so the GUI code is the same.
-- **Per-tab state:** `$?`, working directory, input line and output buffer are private. State is thread-local in thread mode (`chdir()` is process-wide, so each tab tracks its own `cwd`, child processes `chdir()` to it before `exec`, and `cd` is resolved against it).
-- **Shared state (history, clipboard buffer):**
-  - Thread mode: heap memory guarded by a `pthread_mutex_t`.
-  - Process mode: `shm_open` + `mmap` guarded by a POSIX named semaphore (`sem_open`). Both names are unlinked immediately, so nothing is left behind.
-  - History is a ring of the last 10,000 commands. A command typed in one tab is available in every other tab via `history`, `history -s <term>`, `Ctrl+R`, the Up/Down arrows, or from the CLI via `./terminator --history`.
-- **`exit` is per tab:** it ends that tab's shell loop only, so a thread-mode tab can never take the whole app down.
-- **I/O multiplexing:** one `poll()` sleeps on the X11 connection and every tab's output pipe (near 0% CPU when idle).
-- **`multiWatch ["cmd1", "cmd2", ...]`:** one `pipe()` + `fork()` per command, each running through the normal shell engine (so pipes and redirection work inside), and a single `poll()` over all read ends. Output is printed as it arrives in the graded format:
-  ```text
-  "date +%T", 1790860020:
-  ----------------------------------------------------
-  18:37:00
-  ----------------------------------------------------
-  ```
-  It returns by itself when every command has finished. `Ctrl+C` sends the tab an ETX byte (there is no TTY), and the shell then `kill()`s every child process group and returns to the prompt.
-- **`history` built-in:** runs in a child like an external command, so `history | grep make` and `history > file` work.
-- **Known limitations:** in process mode a tab killed while holding the history semaphore would block the others; `;` and `&&` are not supported.
-
-### Signals & Job Control
-There is no TTY, so the kernel never turns Ctrl+C / Ctrl+Z into signals. The GUI sees the `KeyPress`, finds the active tab's foreground job and `kill()`s that job's **process group**. The shell publishes each tab's foreground process group in the shared state (one atomic `int` per tab, so it works in both thread and process mode without a lock).
-
-| Input | From | To | Signal |
-| :--- | :--- | :--- | :--- |
-| `Ctrl+C` | Foreground | Ended | `SIGINT` to `-pgid` (sent by the GUI) |
-| `Ctrl+Z` | Foreground | Stopped | `SIGTSTP` to `-pgid` (sent by the GUI) |
-| `bg %n` | Stopped | Background | `SIGCONT` |
-| `fg %n` | Stopped or background | Foreground | `SIGCONT` |
-| `cmd &` | (new) | Background | none |
-
-- **A job is one process group**, so a single signal reaches every stage of a pipeline (`sleep 100 | cat` stops and dies as one).
-- **Isolation:** only the active tab's foreground group is ever signalled. The GUI, other tabs and background jobs never receive it, and the GUI refuses to signal its own group. With nothing running, `Ctrl+C` just abandons the typed line (and still cancels `multiWatch`); `Ctrl+Z` does nothing.
-- **Foreground wait:** `waitpid(-pgid, ..., WUNTRACED)` per job, so a stop is noticed as well as an exit. A stopped job goes into the tab's job table and prints `[1]+ Stopped sleep 100`; `$?` is `130` after `Ctrl+C` and `128+SIGTSTP` after `Ctrl+Z`.
-- **Built-ins** (run inside the shell, like `cd`): `fg [%n]`, `bg [%n]` (print `sleep 100` / `[1]+ sleep 100 &`). `jobs` prints `[1]+  Stopped   sleep 100` and, like `history`, runs in a child so it can be piped. A bare `fg`/`bg` picks the most recent job.
-- **`cmd &`:** starts the job in its own group, prints `[1] <pid>` and returns to the prompt at once. Its stdin is `/dev/null` so it cannot steal the tab's keyboard. Finished jobs are announced before the next prompt (`[1]+ Done sleep 1`, `Exit N`, `Terminated`). A trailing `&` is the only supported form; `&` elsewhere is a syntax error, and a quoted `'&'` stays literal.
-- **Per-tab job table:** private to each tab (thread-local), as required by the sharing rules. Closing a tab hangs up whatever it left running or stopped.
-- **Headless testing:** in `./terminator --shell` there is no GUI, so `SIGINT`/`SIGTSTP` sent to the process are forwarded to the foreground job and the shell carries on. This is how the job control can be exercised from a script.
-- **Known limitations:** background-job completion is announced when the next line is entered (not asynchronously); no `kill %n`, `wait` or `disown`; at most 64 jobs per tab; `2>&1`-style descriptor duplication is not supported.
-
-### Bash-Style Shell: Hotkeys, Persistent History & Search
-
-#### Bash-style Line Editing & Hotkeys
-- **Cursor navigation & editing:** in-line cursor movement (`input_pos`), rendering a block cursor with inverted character highlighting at the cursor position.
-- **Default Keybindings:**
-
-| Action | Default Key | Description |
-| :--- | :--- | :--- |
-| Move in line | `Left` / `Right` | Move cursor backward / forward |
-| Line bounds | `Ctrl+A` / `Ctrl+E` | Jump to start / end of line |
-| History navigation | `Up` / `Down` | Recall previous / next commands from shared history |
-| Delete to bounds | `Ctrl+U` / `Ctrl+K` | Delete from cursor to start / end of line |
-| Delete word | `Ctrl+W` | Delete word before cursor |
-| Clear screen | `Ctrl+L` | Clear tab display buffer |
-| Close tab / EOF | `Ctrl+D` | Send EOF / close tab (or delete char under cursor) |
-| Clipboard | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy current line to / paste from shared clipboard |
-| Tab management | `Ctrl+T` | Create new tab |
-| Signals | `Ctrl+C` / `Ctrl+Z` | Interrupt / suspend foreground job |
-| Scrollback | `Shift+PageUp` / `Shift+PageDown` | Scroll up / down 10 lines through output history |
-| Mouse wheel | `Wheel Up` / `Wheel Down` | Scroll up / down 3 lines per tick |
-
-#### Keybinding Configuration (`~/.terminatorrc`)
-Custom bindings survive restarts and can be reconfigured without recompiling via `~/.terminatorrc` (or `$TERMINATOR_RC`):
-```bash
-# ~/.terminatorrc
-bind clear-screen Ctrl+Shift+L
-bind delete-word Alt+Backspace
-```
-- Invalid bindings warn on `stderr` and preserve default bindings.
-
-#### Persistent History & Reverse Search
-- **Persistent storage:** history is saved to `~/.terminator_history` (or `$TERMINATOR_HISTFILE`), storing up to 10,000 commands across restarts.
-- **Shared across tabs:** commands entered in any tab are immediately appended to disk and visible to all tabs (both thread and process modes).
-- **Viewing & searching history:**
-  - Inside any tab: run `history` (supports piping/redirection, e.g., `history | grep ls`), `history -s <term>`, or use the `Up` / `Down` arrow keys.
-  - From the CLI: run `./terminator --history` to print the shared command history across all tabs.
-- **`Ctrl+R` Reverse Search:** prompts `Enter search term: ` with prioritized matching rules:
-  1. Exact match: displays the most recent matching command.
-  2. Longest common substring match: displays commands sharing the longest substring if longer than 2 characters.
-  3. Otherwise displays `No match for search term in history`.
-
-#### Tab Filename Auto-Completion
-- **Directory-aware matching:** pressing `Tab` scans the current directory for filenames matching the word before the cursor.
-- **Completion rules:**
-  1. Single match: completes filename immediately, preserving the rest of the command line.
-  2. Several matches: extends input to the longest common prefix (LCP), then displays a numbered list of candidates and waits for a numeric selection (`1`..`9`).
-  3. No match: does nothing.
-
-#### Shell Scripting Engine & Control Flow
-- **Native interpreter:** executes scripts directly within Terminator without delegating to `/bin/bash`.
-- **Script invocation:** supports `./run.sh`, `bash run.sh`, `sh run.sh`, and `source run.sh` (or `. run.sh`).
-- **Variables & parameters:** supports variable assignment (`VAR=val`), expansion (`$VAR`, `${VAR}`), positional arguments (`$1`..`$9`, `$#`, `$0`), and command status (`$?`).
-- **Conditional execution:** nested `if / elif / else / fi` blocks with built-in `[` test supporting file checks (`-f`, `-d`, `-e`), string comparisons (`=`, `!=`, `-z`, `-n`), and integer comparisons (`-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`).
-- **Non-fatal script exit:** `exit n` inside a script terminates only the script execution with status `n` without closing the tab or shell session.
-
-#### Command & Subcommand "Did You Mean?" Suggestions
-- **Fuzzy command matching:** Uses Damerau-Levenshtein edit distance to suggest matching built-ins or executables in `$PATH` when a command is not found (e.g., `sl` suggests `ls`).
-- **Subcommand matching for popular CLIs:** If commands like `git`, `docker`, `apt`, `npm`, or `cargo` fail due to a typo in the subcommand (e.g., `git cmmit`), Terminator suggests the intended subcommand (`Did you mean 'git commit'?`).
-
-#### Live Syntax Highlighting & Ghost Autosuggestions
-- **Real-time command validation:** Command token is colored green (`#a6e3a1`) if recognized and red/pink (`#f38ba8`) if invalid.
-- **Quote styling:** Single and double-quoted strings are highlighted in peach (`#fab387`).
-- **Fish-style ghost suggestions:** Automatically renders matching command tails from history in dimmed gray ahead of the cursor.
-- **Right Arrow acceptance:** Pressing `Right Arrow` at the end of the input line instantly accepts the ghost suggestion.
-
-#### Background Tab Activity Badges & Audio Alerts
-- **Unread notification dot:** When a background tab produces output or completes a running task, a colored notification badge appears on its tab bar.
-- **X11 notification bell:** Triggers an audible alert (`XBell`) when background tasks generate output or finish executing.
-- **Auto-dismiss on focus:** Switching to or clicking on an unread tab instantly dismisses its notification dot.
-
-#### Native Smooth Scrollback & Mouse Wheel Support
-- **Per-tab scrollback buffer:** Inspect up to 1,000 lines of historical output per tab using `scroll_offset` without losing live incoming streams.
-- **Mouse wheel & keyboard navigation:** Scroll smoothly by 3 lines per tick using the mouse wheel (`Button4` / `Button5`) or jump 10 lines at a time via `Shift+PageUp` / `Shift+PageDown` (or `PageUp` / `PageDown`).
-- **Proportional scrollbar & floating indicator badge:** Renders a dynamic scrollbar track and thumb along the right edge of the window, plus a floating `[+ N lines]` badge in the top-right corner whenever viewing historical output.
-- **Auto-scroll on input:** Typing any key or submitting a command automatically resets the viewport to the live prompt at the bottom.
-
+### Future Scope
+1. **Pseudo-Terminal (`posix_openpt` / `forkpty`) Integration:** Add optional `pty` allocation alongside full ANSI/VT100 escape sequence parsing to support interactive TUI applications like `vim`, `nano`, and `htop`.
+2. **Split Panes & Multiplexed Layouts:** Extend the X11 viewport renderer to support horizontal and vertical split panes within a single tab.
+3. **Wildcard Globbing & Logical Chaining:** Extend the lexer to expand `*` / `?` globs via `glob(3)` and construct AST nodes for `&&`, `||`, and `;` command lists.
+4. **Mouse Selection & System Clipboard Integration:** Add click-and-drag text selection in the X11 viewport wired directly to the `XA_CLIPBOARD` X11 selection atom.

@@ -41,11 +41,17 @@ graph TD
     SIG["Signal Delivery Subsystem"]
     SHM["POSIX Shared Memory & Semaphores"]
 
+    UI_WIN -- "ButtonPress / Hotkeys" --> UI_TAB
     UI_WIN -- "KeyPress Events" --> PARSER
-    UI_BUF <-- "Stdout / Stderr via Pipes" -- BUILTIN
+    PARSER -- "Built-in Execution" --> BUILTIN
+    BUILTIN -- "Stdout / Stderr via Pipes" --> UI_BUF
+    PARSER -- "Record / Recall" --> HIST
     PARSER -- "fork() / execvp()" --> PROC
     PARSER -- "pipe() / dup2()" --> PIPES
+    PIPES -- "Stream Output" --> UI_BUF
     PROC -- "waitpid() / Signals" --> JOBTAB
+    JOBTAB -- "kill(-pgid, sig)" --> SIG
+    UI_TAB -- "Sync State" --> SHM
 
     classDef gui fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff;
     classDef shell fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff;
@@ -678,13 +684,13 @@ To provide rich terminal aesthetics, Terminator features a modern two-pill statu
 
 ```mermaid
 graph LR
-    P1["Directory (~/path)\nColor: #89b4fa (Blue)"]
-    P2["Git Branch (| on main)\nColor: #a6e3a1 (Green)"]
-    DASH["Connector Dashes (------)\nColor: #6c7086 (Muted)"]
-    P3["Duration (took 1s)\nColor: #f9e2af (Yellow)"]
-    P4["Status (INT / ERR)\nColor: #f38ba8 (Red)"]
-    P5["Time (at 12:00 PM)\nColor: #94e2d5 (Teal)"]
-    PROMPT["Clean Input Line: user@terminator> █"]
+    P1["Directory (~/path)"]
+    P2["Git Branch (| on main)"]
+    DASH["Connector Dashes (------)"]
+    P3["Duration (took 1s)"]
+    P4["Status (INT / ERR)"]
+    P5["Time (at 12:00 PM)"]
+    PROMPT["Clean Input Line: user@terminator>"]
 
     P1 --- P2 --- DASH --- P3 --- P4 --- P5
     DASH --> PROMPT
