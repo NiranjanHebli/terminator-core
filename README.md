@@ -97,12 +97,27 @@ Fuzzy matching based on Damerau-Levenshtein edit distance for mistyped commands 
 ### Tab Filename Auto-Completion & Candidate Menu
 Directory-aware filename expansion with longest common prefix (LCP) completion and numbered selection menus:
 
+<<<<<<< HEAD
 *(Insert screenshot here, e.g., `<img ... />`)*
+=======
+<img width="801" height="82" alt="Screenshot 2026-11-03 at 4 49 00 PM" src="https://github.com/user-attachments/assets/efe90ec1-530f-47a7-8ed4-6d773c439af7" />
+
+>>>>>>> f3ba121 (docs :update README with more feature screenshots)
 
 ### Fish-Style Ghost Autosuggestions
 Renders dimmed historical command completions ahead of the cursor with one-key Right Arrow (`->`) acceptance:
 
+<<<<<<< HEAD
 *(Insert screenshot here, e.g., `<img ... />`)*
+=======
+
+<img width="819" height="540" alt="Screenshot 2026-11-03 at 4 33 55 PM" src="https://github.com/user-attachments/assets/d27a8ab8-977b-4c72-b1e7-39912a5618a3" />
+
+(Pressing -> after text written in previous screenshot)
+
+<img width="819" height="550" alt="Screenshot 2026-11-03 at 4 34 49 PM" src="https://github.com/user-attachments/assets/cd9b5865-9da0-4102-962e-080225e1af14" />
+
+>>>>>>> f3ba121 (docs :update README with more feature screenshots)
 
 ### Multiline Input & Continuation Prompt (`> `)
 Accumulates incomplete expressions (unclosed quotes, trailing backslashes, open subshells) with continuation prompts:
@@ -112,22 +127,32 @@ Accumulates incomplete expressions (unclosed quotes, trailing backslashes, open 
 ### Native Shell Scripting & Control Flow
 Executes `.sh` scripts natively with variables, nested `if / elif / else / fi` blocks, and `[` test evaluations:
 
-*(Insert screenshot here, e.g., `<img ... />`)*
+<img width="820" height="180" alt="Screenshot 2026-11-03 at 4 50 30 PM" src="https://github.com/user-attachments/assets/d2b2d343-d46a-42f7-ae63-721957353baf" />
+
 
 ### Multi-Stage Pipelines & I/O Redirection
 Chains arbitrary commands across Unix pipes (`|`) with unified process groups and file descriptor redirections (`<`, `>`, `>>`):
 
+<<<<<<< HEAD
 *(Insert screenshot here, e.g., `<img ... />`)*
+=======
+<img width="811" height="157" alt="Screenshot 2026-11-03 at 4 52 23 PM" src="https://github.com/user-attachments/assets/2693a774-57fc-433a-ae0f-567c98f89d63" />
+
+>>>>>>> f3ba121 (docs :update README with more feature screenshots)
 
 ### Background Tab Activity Badges & Audio Alerts
 Displays unread notification dots on hidden background tabs and triggers an audible bell (`XBell`) upon job completion:
 
-*(Insert screenshot here, e.g., `<img ... />`)*
+Run sleep 3 on Tab 1 and immediately switch to tab 2
+
+<img width="480" height="41" alt="Screenshot 2026-11-03 at 4 53 09 PM" src="https://github.com/user-attachments/assets/7d2d2d96-9bc6-4a50-96b2-388cd29472d7" />
+
 
 ### Process Mode Fault Isolation (`--process` / `useProcess=True`)
 Runs tabs in isolated forked processes synchronized via POSIX shared memory (`mmap`) and named semaphores (`sem_open`):
 
-*(Insert screenshot here, e.g., `<img ... />`)*
+<img width="820" height="381" alt="Screenshot 2026-11-03 at 5 00 12 PM" src="https://github.com/user-attachments/assets/aff918b3-ee8c-4699-96d0-7d57fc57de6e" />
+
 
 ### Runtime Keybinding Customization (`~/.terminatorrc`)
 Reconfigures hotkeys on the fly without recompilation via custom configuration files:
