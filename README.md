@@ -135,12 +135,6 @@ Runs tabs in isolated forked processes synchronized via POSIX shared memory (`mm
 
 <img width="820" height="381" alt="Screenshot 2026-11-03 at 5 00 12 PM" src="https://github.com/user-attachments/assets/aff918b3-ee8c-4699-96d0-7d57fc57de6e" />
 
-
-### Runtime Keybinding Customization (`~/.terminatorrc`)
-Reconfigures hotkeys on the fly without recompilation via custom configuration files:
-
-*(Insert screenshot here, e.g., `<img ... />`)*
-
 ---
 
 ## 5. Demo Video
@@ -164,13 +158,13 @@ Watch the complete feature walkthrough and live presentation of Terminator in ac
 
 ### 6.2 Shell Execution, Quoting & Plumbing
 - **External Commands & Built-ins:** Full `fork()` -> `execvp()` -> `waitpid()` lifecycle alongside built-in commands (`cd`, `exit`, `jobs`, `fg`, `bg`, `history`, `multiWatch`, `source`, `[`).
-- **Multiline Input, Quoting & Expansion:** Supports single quotes (`'...'`), double quotes (`"..."`), backslash escaping (`\`), variable expansion (`$VAR`, `${VAR}`, `$?`, `$$`), and recursive nested command substitution (`$(...)`). Incomplete lines automatically prompt with `> `.
+- **Multiline Input, Quoting & Expansion:** Supports single quotes (`'...'`), double quotes (`"..."`), backslash escaping (`\`), wildcard glob expansion (`*`, `?`), variable expansion (`$VAR`, `${VAR}`, `$?`, `$$`), and recursive nested command substitution via both `$(...)` and backticks (`` `...` ``). Incomplete lines automatically prompt with `> `.
 - **I/O Redirection (`<`, `>`, `>>`):** Rewires file descriptors in forked child processes using `open()` and `dup2()` without mutating parent shell descriptors.
 - **Multi-Stage Pipelines (`cmd1 | cmd2 | ... | cmdN`):** Chains arbitrary-length pipelines across $N-1$ Unix pipe pairs, aligns all stages into a single process group (`setpgid`), closes unused descriptors to guarantee clean `EOF` propagation, and records the final stage's exit code in `$?`.
 
 ### 6.3 Dual Concurrency & Parallel Execution
 - **Thread Mode vs. Process Mode:** Switch seamlessly at launch between single-process `pthread` tabs (`./terminator --thread`) and fault-isolated `fork` tabs (`./terminator --process`) backed by `mmap` shared memory.
-- **Parallel Multi-Command Monitor (`multiWatch`):** Executes multiple commands or pipelines in parallel (`multiWatch ["cmd1", "cmd2", ...]`), multiplexing live output streams via `poll()` with real-time timestamps until interrupted via `Ctrl+C`.
+- **Parallel Multi-Command Monitor (`multiWatch`):** Executes multiple commands or pipelines in parallel (`multiWatch ["cmd1", "cmd2", ...]`), multiplexing live output streams via `poll()` with real-time timestamps and automatically re-running completed commands every 2 seconds until interrupted via `Ctrl+C`.
 
 ### 6.4 No-TTY Signal Handling & Job Control
 - **Process Group Signal Routing:** Because there is no kernel `pty` to translate keystrokes into signals, the GUI intercepts `Ctrl+C` and `Ctrl+Z`, looks up the active tab's atomic foreground process group (`fg_pgid`), and dispatches `SIGINT` or `SIGTSTP` to `-pgid`.
@@ -179,7 +173,7 @@ Watch the complete feature walkthrough and live presentation of Terminator in ac
 ### 6.5 Bash-Style Productivity & Scripting
 - **Persistent Shared History & Reverse Search (`Ctrl+R`):** Persists 10,000 commands across restarts in `~/.terminator_history`, synchronized immediately across all tabs. Includes `Ctrl+R` reverse search with exact and longest-common-substring (>2 chars) matching.
 - **Interactive Tab Filename Completion:** Completes unique filenames inline on `Tab`, or expands to the Longest Common Prefix (LCP) and presents an interactive numbered selection menu (`1..9`) when multiple files match.
-- **Native Shell Scripting Engine:** Executes `.sh` scripts natively (`./check.sh`, `bash script.sh`, `source script.sh`) with positional arguments (`$1`..`$9`, `$#`), local variables, nested `if / elif / else / fi` control flow, and `[` test evaluations (`-f`, `-d`, `-e`, `=`, `!=`, `-eq`, `-lt`, etc.).
+- **Native Shell Scripting Engine:** Executes `.sh` scripts natively (`./check.sh`, `bash script.sh`, `source script.sh`) with upfront syntax validation, positional arguments (`$1`..`$9`, `$#`), local variables, nested `if / elif / else / fi` control flow, and `[` test evaluations (`-f`, `-d`, `-e`, `=`, `!=`, `-eq`, `-lt`, etc.).
 - **"Did You Mean?" Typo Suggestion Engine:** Uses Damerau-Levenshtein edit distance to suggest corrections for mistyped commands (`sl` -> `ls`) and subcommands (`git cmmit` -> `git commit`).
 
 ---
@@ -292,14 +286,14 @@ bg %1                            # Resumes job in background: prints [1]+ sleep 
 | **Delete Word** | `Ctrl+W` | Delete word before cursor |
 | **Clear Screen** | `Ctrl+L` | Clear active tab display buffer |
 | **Close Tab / EOF** | `Ctrl+D` | Close current tab (on empty line) or delete character under cursor |
-| **Clipboard** | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy current input line to / paste from shared clipboard |
+| **Clipboard** | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy current input line to / paste from X11 selections (`CLIPBOARD` / `XA_PRIMARY`) and shared clipboard |
 | **New Tab** | `Ctrl+T` | Spawn a new terminal tab |
 | **Job Signals** | `Ctrl+C` / `Ctrl+Z` | Send `SIGINT` (interrupt) / `SIGTSTP` (suspend) to foreground process group |
 | **Scrollback (Keys)** | `Shift+PageUp` / `Shift+PageDown` | Scroll viewport up / down 10 lines through history |
 | **Scrollback (Mouse)** | `Wheel Up` / `Wheel Down` | Scroll viewport up / down 3 lines per tick |
 
 ### Custom Keybindings (`~/.terminatorrc`)
-Keybindings can be customized without recompiling by loading a configuration file directly, setting `$TERMINATOR_RC`, or copying to `~/.terminatorrc`:
+Keybindings can be customized without recompiling by loading a configuration file directly, setting `$TERMINATOR_RC`, or copying to `~/.terminatorrc` (invalid or conflicting bindings are reported with line numbers and fall back to defaults):
 ```bash
 ./terminator sample.terminatorrc   # Direct launch with custom config
 # or copy globally:
@@ -319,11 +313,11 @@ bind scroll-down Shift+PageDown
 
 ### Known Limitations
 - **No Pseudo-Terminal (`pty`) Emulation:** Because communication uses standard Unix pipes rather than a kernel `pty`, full-screen curses applications (`vim`, `htop`, `less`) that require terminal capability queries (`ioctl` / `termios`) are not intended to run inside the graphical window.
-- **Logical Operators & Globbing:** Chained logical operators (`&&`, `||`, `;`), filename wildcard expansion (`*.c`), and descriptor duplication (`2>&1`) are currently omitted by design.
+- **Loops & Shell Functions:** While `if / elif / else / fi`, `[ ... ]`, `&&`, `||`, `;`, `$(...)`, backticks (`` `...` ``), and wildcard globs (`*`, `?`) are natively supported, `for`/`while` loops and shell functions are omitted per project specification.
 - **Semaphore Recovery in Process Mode:** If an external signal forcefully terminates a tab process (`SIGKILL`) while it holds the named history semaphore, other tabs waiting on history lock acquisition may block.
 
 ### Future Scope
 1. **Pseudo-Terminal (`posix_openpt` / `forkpty`) Integration:** Add optional `pty` allocation alongside full ANSI/VT100 escape sequence parsing to support interactive TUI applications like `vim`, `nano`, and `htop`.
 2. **Split Panes & Multiplexed Layouts:** Extend the X11 viewport renderer to support horizontal and vertical split panes within a single tab.
-3. **Wildcard Globbing & Logical Chaining:** Extend the lexer to expand `*` / `?` globs via `glob(3)` and construct AST nodes for `&&`, `||`, and `;` command lists.
-4. **Mouse Selection & System Clipboard Integration:** Add click-and-drag text selection in the X11 viewport wired directly to the `XA_CLIPBOARD` X11 selection atom.
+3. **Loops & Functions in Native Script Engine:** Extend the script parser to support `for`, `while`, `case`, and user-defined shell functions.
+4. **Mouse Drag Text Selection:** Add click-and-drag text highlighting in the X11 viewport to complement keyboard X11 selection copy/paste.

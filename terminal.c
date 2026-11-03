@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -6,6 +7,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
@@ -73,6 +75,10 @@ static XFontStruct *font = NULL;
 static int char_width = 8;
 static int char_height = 16;
 static int font_ascent = 12;
+static Atom xa_clipboard = None;
+static Atom xa_targets = None;
+static Atom xa_utf8 = None;
+static Atom xa_sel_prop = None;
 
 static unsigned long col_bg;
 static unsigned long col_tab_bar;
@@ -141,7 +147,9 @@ enum {
   NEED_SQUOTE,    /* unterminated '...'            */
   NEED_DQUOTE,    /* unterminated "..."            */
   NEED_BACKSLASH, /* line ends with a lone '\'     */
-  NEED_PAREN      /* unterminated $( ... )         */
+  NEED_PAREN,     /* unterminated $( ... )         */
+  NEED_BACKTICK,  /* unterminated ` ... `          */
+  NEED_FI         /* unterminated if ... fi        */
 };
 
 #define MAX_HISTORY 10000
@@ -180,6 +188,7 @@ static _Thread_local int tab_out_fd =
     -1; /* where diagnostics and the prompt text go */
 static _Thread_local int cur_stdout_fd = -1; /* where command output goes */
 static _Thread_local char tab_cwd[PATH_MAX]; /* cwd of this tab only */
+static _Thread_local char tab_oldpwd[PATH_MAX]; /* previous cwd for cd - */
 
 static void write_all(int fd, const char *s, size_t n) {
   while (n > 0) {
@@ -528,6 +537,7 @@ static int do_cd(const char *dest) {
     sh_err("terminator: cd: %s: %s\n", dest, strerror(errno));
     return 1;
   }
+  snprintf(tab_oldpwd, sizeof(tab_oldpwd), "%s", tab_cwd);
   snprintf(tab_cwd, sizeof(tab_cwd), "%s", resolved);
   return 0;
 }
@@ -831,6 +841,24 @@ static int multi_watch(const char *args);
 
 static int scan_unit(const char *s, size_t *i, int in_paren);
 
+/* Scan the inside of a `...` substitution; *i is just after the opening '`'. */
+static int scan_backtick(const char *s, size_t *i) {
+  while (s[*i]) {
+    char c = s[*i];
+    if (c == '\\') {
+      if (!s[*i + 1])
+        return NEED_BACKSLASH;
+      *i += 2;
+    } else if (c == '`') {
+      (*i)++;
+      return INPUT_COMPLETE;
+    } else {
+      (*i)++;
+    }
+  }
+  return NEED_BACKTICK;
+}
+
 /* Scan the inside of a "..." string; *i is just after the opening quote. */
 static int scan_dquote(const char *s, size_t *i) {
   while (s[*i]) {
@@ -846,6 +874,11 @@ static int scan_dquote(const char *s, size_t *i) {
       int r;
       *i += 2;
       if ((r = scan_unit(s, i, 1)) != INPUT_COMPLETE)
+        return r;
+    } else if (c == '`') {
+      int r;
+      (*i)++;
+      if ((r = scan_backtick(s, i)) != INPUT_COMPLETE)
         return r;
     } else {
       (*i)++;
@@ -875,6 +908,10 @@ static int scan_unit(const char *s, size_t *i, int in_paren) {
     } else if (c == '$' && s[*i + 1] == '(') {
       *i += 2;
       if ((r = scan_unit(s, i, 1)) != INPUT_COMPLETE)
+        return r;
+    } else if (c == '`') {
+      (*i)++;
+      if ((r = scan_backtick(s, i)) != INPUT_COMPLETE)
         return r;
     } else if (in_paren && c == ')') {
       (*i)++;
@@ -925,8 +962,6 @@ static const char *get_shell_var(const char *name) {
   return getenv(name);
 }
 
-enum { NEED_FI = 5 };
-
 /* Count unclosed 'if' blocks across lines/semicolons while respecting quotes */
 static int count_if_depth(const char *s) {
   int depth = 0;
@@ -965,6 +1000,12 @@ static int count_if_depth(const char *s) {
         }
         if (s[i])
           i++;
+      } else if (s[i] == '$' && s[i + 1] == '(') {
+        i += 2;
+        scan_unit(s, &i, 1);
+      } else if (s[i] == '`') {
+        i++;
+        scan_backtick(s, &i);
       } else if (s[i] == '\\' && s[i + 1]) {
         i += 2;
       } else {
@@ -1060,6 +1101,113 @@ static void tok_push(TokenList *tl, int type, char *text) {
   tl->count++;
 }
 
+static int cmp_cstr_ptr(const void *a, const void *b) {
+  return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static int is_var_assign_word(const char *w) {
+  const char *eq = strchr(w, '=');
+  if (!eq || eq == w || !(isalpha((unsigned char)w[0]) || w[0] == '_'))
+    return 0;
+  for (const char *p = w; p < eq; p++) {
+    if (!(isalnum((unsigned char)*p) || *p == '_'))
+      return 0;
+  }
+  return 1;
+}
+
+/* Push a word token, expanding unquoted * and ? globs against tab_cwd */
+static void tok_push_word_or_glob(TokenList *tl, char *word, int allow_glob) {
+  if (!allow_glob || is_var_assign_word(word) ||
+      (!strchr(word, '*') && !strchr(word, '?'))) {
+    tok_push(tl, TOK_WORD, word);
+    return;
+  }
+
+  char dir_prefix[PATH_MAX];
+  char dir_open[PATH_MAX * 2];
+  const char *pattern = word;
+  const char *last_slash = strrchr(word, '/');
+
+  if (last_slash) {
+    size_t dlen = (size_t)(last_slash - word);
+    if (dlen + 2 > sizeof(dir_prefix)) {
+      tok_push(tl, TOK_WORD, word);
+      return;
+    }
+    memcpy(dir_prefix, word, dlen + 1);
+    dir_prefix[dlen + 1] = '\0';
+    pattern = last_slash + 1;
+
+    /* If directory prefix itself has wildcards, keep literal */
+    if (strchr(dir_prefix, '*') || strchr(dir_prefix, '?')) {
+      tok_push(tl, TOK_WORD, word);
+      return;
+    }
+
+    char sub[PATH_MAX];
+    if (dlen == 0) {
+      snprintf(dir_open, sizeof(dir_open), "/");
+    } else {
+      memcpy(sub, word, dlen);
+      sub[dlen] = '\0';
+      if (sub[0] == '/')
+        snprintf(dir_open, sizeof(dir_open), "%s", sub);
+      else
+        snprintf(dir_open, sizeof(dir_open), "%s/%s",
+                 tab_cwd[0] ? tab_cwd : ".", sub);
+    }
+  } else {
+    dir_prefix[0] = '\0';
+    snprintf(dir_open, sizeof(dir_open), "%s", tab_cwd[0] ? tab_cwd : ".");
+  }
+
+  DIR *d = opendir(dir_open);
+  if (!d) {
+    tok_push(tl, TOK_WORD, word);
+    return;
+  }
+
+  char **matches = NULL;
+  int mcount = 0, mcap = 0;
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+      continue;
+    if (de->d_name[0] == '.' && pattern[0] != '.')
+      continue;
+    if (fnmatch(pattern, de->d_name, 0) == 0) {
+      if (mcount == mcap) {
+        mcap = mcap ? mcap * 2 : 16;
+        matches = realloc(matches, (size_t)mcap * sizeof(char *));
+        if (!matches)
+          _exit(1);
+      }
+      size_t plen = strlen(dir_prefix);
+      size_t nlen = strlen(de->d_name);
+      char *full = malloc(plen + nlen + 1);
+      if (!full)
+        _exit(1);
+      memcpy(full, dir_prefix, plen);
+      memcpy(full + plen, de->d_name, nlen + 1);
+      matches[mcount++] = full;
+    }
+  }
+  closedir(d);
+
+  if (mcount == 0) {
+    free(matches);
+    tok_push(tl, TOK_WORD, word);
+    return;
+  }
+
+  qsort(matches, (size_t)mcount, sizeof(char *), cmp_cstr_ptr);
+  for (int i = 0; i < mcount; i++)
+    tok_push(tl, TOK_WORD, matches[i]);
+  free(matches);
+  free(word);
+}
+
 static void tok_free(TokenList *tl) {
   for (int i = 0; i < tl->count; i++)
     free(tl->items[i].text);
@@ -1124,7 +1272,7 @@ static char *command_substitution(const char *cmd) {
 
 /* Append an expansion to w; unquoted values are split into words */
 static void emit_expansion(TokenList *tl, Str *w, int *in_word, const char *val,
-                           int quoted) {
+                           int quoted, int *allow_glob) {
   if (quoted) {
     str_puts(w, val);
     *in_word = 1;
@@ -1133,10 +1281,11 @@ static void emit_expansion(TokenList *tl, Str *w, int *in_word, const char *val,
   for (const char *p = val; *p; p++) {
     if (*p == ' ' || *p == '\t' || *p == '\n') {
       if (*in_word) {
-        tok_push(tl, TOK_WORD, w->data ? w->data : empty_str());
+        tok_push_word_or_glob(tl, w->data ? w->data : empty_str(), *allow_glob);
         w->data = NULL;
         w->len = w->cap = 0;
         *in_word = 0;
+        *allow_glob = 1;
       }
     } else {
       str_putc(w, *p);
@@ -1145,26 +1294,53 @@ static void emit_expansion(TokenList *tl, Str *w, int *in_word, const char *val,
   }
 }
 
+/* Expand `...` at s[*i] into the current word (supports nested \`...\` and multiline) */
+static void expand_backtick(const char *s, size_t *i, TokenList *tl, Str *w,
+                            int *in_word, int quoted, int *allow_glob) {
+  (*i)++; /* skip opening '`' */
+  Str inner = {0};
+  while (s[*i] && s[*i] != '`') {
+    if (s[*i] == '\\') {
+      if (s[*i + 1] == '\n') {
+        *i += 2;
+      } else if (s[*i + 1] == '`' || s[*i + 1] == '\\' || s[*i + 1] == '$') {
+        str_putc(&inner, s[*i + 1]);
+        *i += 2;
+      } else {
+        str_putc(&inner, s[(*i)++]);
+      }
+    } else {
+      str_putc(&inner, s[(*i)++]);
+    }
+  }
+  if (s[*i] == '`')
+    (*i)++;
+  char *val = command_substitution(inner.data ? inner.data : "");
+  free(inner.data);
+  emit_expansion(tl, w, in_word, val ? val : "", quoted, allow_glob);
+  free(val);
+}
+
 /* Expand the '$' at s[*i] into the current word; a lone '$' is literal */
 static void expand_dollar(const char *s, size_t *i, TokenList *tl, Str *w,
-                          int *in_word, int quoted) {
+                          int *in_word, int quoted, int *allow_glob) {
   char tmp[32];
   if (s[*i + 1] == '?') {
     snprintf(tmp, sizeof(tmp), "%d", last_status);
-    emit_expansion(tl, w, in_word, tmp, quoted);
+    emit_expansion(tl, w, in_word, tmp, quoted, allow_glob);
     *i += 2;
   } else if (s[*i + 1] == '#') {
     snprintf(tmp, sizeof(tmp), "%d", script_argc);
-    emit_expansion(tl, w, in_word, tmp, quoted);
+    emit_expansion(tl, w, in_word, tmp, quoted, allow_glob);
     *i += 2;
   } else if (s[*i + 1] >= '0' && s[*i + 1] <= '9') {
     int idx = s[*i + 1] - '0';
     const char *val = (idx <= script_argc) ? script_argv[idx] : "";
-    emit_expansion(tl, w, in_word, val, quoted);
+    emit_expansion(tl, w, in_word, val, quoted, allow_glob);
     *i += 2;
   } else if (s[*i + 1] == '$') {
     snprintf(tmp, sizeof(tmp), "%d", (int)getpid());
-    emit_expansion(tl, w, in_word, tmp, quoted);
+    emit_expansion(tl, w, in_word, tmp, quoted, allow_glob);
     *i += 2;
   } else if (s[*i + 1] == '(') {
     /* Find the matching ')', honouring quotes and nesting (innermost first) */
@@ -1179,7 +1355,7 @@ static void expand_dollar(const char *s, size_t *i, TokenList *tl, Str *w,
     inner[inner_len] = '\0';
     char *val = command_substitution(inner);
     free(inner);
-    emit_expansion(tl, w, in_word, val ? val : "", quoted);
+    emit_expansion(tl, w, in_word, val ? val : "", quoted, allow_glob);
     free(val);
     *i = j;
   } else if (s[*i + 1] == '{' || isalpha((unsigned char)s[*i + 1]) ||
@@ -1205,7 +1381,7 @@ static void expand_dollar(const char *s, size_t *i, TokenList *tl, Str *w,
       }
     }
     const char *val = n ? get_shell_var(name) : NULL;
-    emit_expansion(tl, w, in_word, val ? val : "", quoted);
+    emit_expansion(tl, w, in_word, val ? val : "", quoted, allow_glob);
     *i = j;
   } else {
     str_putc(w, '$');
@@ -1218,15 +1394,17 @@ static void expand_dollar(const char *s, size_t *i, TokenList *tl, Str *w,
 static void tokenize(const char *s, TokenList *tl) {
   Str w = {0};
   int in_word = 0;
+  int allow_glob = 1;
   size_t i = 0;
 
 #define END_WORD()                                                             \
   do {                                                                         \
     if (in_word) {                                                             \
-      tok_push(tl, TOK_WORD, w.data ? w.data : empty_str());                   \
+      tok_push_word_or_glob(tl, w.data ? w.data : empty_str(), allow_glob);    \
       w.data = NULL;                                                           \
       w.len = w.cap = 0;                                                       \
       in_word = 0;                                                             \
+      allow_glob = 1;                                                          \
     }                                                                          \
   } while (0)
 
@@ -1242,6 +1420,8 @@ static void tokenize(const char *s, TokenList *tl) {
       if (s[i + 1] == '\n') { /* line continuation: vanishes */
         i += 2;
       } else if (s[i + 1]) {
+        if (s[i + 1] == '*' || s[i + 1] == '?')
+          allow_glob = 0;
         str_putc(&w, s[i + 1]);
         in_word = 1;
         i += 2;
@@ -1251,6 +1431,7 @@ static void tokenize(const char *s, TokenList *tl) {
     } else if (c == '\'') {
       i++;
       in_word = 1;
+      allow_glob = 0;
       while (s[i] && s[i] != '\'')
         str_putc(&w, s[i++]);
       if (s[i])
@@ -1258,14 +1439,18 @@ static void tokenize(const char *s, TokenList *tl) {
     } else if (c == '"') {
       i++;
       in_word = 1;
+      allow_glob = 0;
       while (s[i] && s[i] != '"') {
-        if (s[i] == '\\' && (s[i + 1] == '"' || s[i + 1] == '\\' ||
-                             s[i + 1] == '$' || s[i + 1] == '\n')) {
+        if (s[i] == '\\' &&
+            (s[i + 1] == '"' || s[i + 1] == '\\' || s[i + 1] == '$' ||
+             s[i + 1] == '`' || s[i + 1] == '\n')) {
           if (s[i + 1] != '\n')
             str_putc(&w, s[i + 1]);
           i += 2;
         } else if (s[i] == '$') {
-          expand_dollar(s, &i, tl, &w, &in_word, 1);
+          expand_dollar(s, &i, tl, &w, &in_word, 1, &allow_glob);
+        } else if (s[i] == '`') {
+          expand_backtick(s, &i, tl, &w, &in_word, 1, &allow_glob);
         } else {
           str_putc(&w, s[i++]);
         }
@@ -1273,7 +1458,9 @@ static void tokenize(const char *s, TokenList *tl) {
       if (s[i])
         i++;
     } else if (c == '$') {
-      expand_dollar(s, &i, tl, &w, &in_word, 0);
+      expand_dollar(s, &i, tl, &w, &in_word, 0, &allow_glob);
+    } else if (c == '`') {
+      expand_backtick(s, &i, tl, &w, &in_word, 0, &allow_glob);
     } else if (c == '|') {
       END_WORD();
       tok_push(tl, TOK_PIPE, NULL);
@@ -1500,6 +1687,9 @@ static size_t next_statement(const char *s, size_t pos, char **out_stmt,
       } else if (s[pos] == '$' && s[pos + 1] == '(') {
         pos += 2;
         scan_unit(s, &pos, 1);
+      } else if (s[pos] == '`') {
+        pos++;
+        scan_backtick(s, &pos);
       } else if (s[pos] == '\\' && s[pos + 1]) {
         pos += 2;
       } else {
@@ -1985,6 +2175,171 @@ static void check_subcommand_suggestion(int argc, char **argv, int status) {
 
 static int execute_single_line(const char *line);
 
+/* Pre-validate script syntax (quotes, substitutions, if/elif/else/then/fi)
+ * so any syntax error is reported instead of running the script. */
+static int validate_script_syntax(const char *label, const char *s) {
+  size_t scan_pos = 0;
+  int st = scan_unit(s, &scan_pos, 0);
+  if (st == NEED_SQUOTE) {
+    sh_err("terminator: %s: syntax error: unexpected EOF while looking for matching '''\n",
+           label);
+    return 2;
+  }
+  if (st == NEED_DQUOTE) {
+    sh_err("terminator: %s: syntax error: unexpected EOF while looking for matching '\"'\n",
+           label);
+    return 2;
+  }
+  if (st == NEED_PAREN) {
+    sh_err("terminator: %s: syntax error: unexpected EOF while looking for matching ')'\n",
+           label);
+    return 2;
+  }
+  if (st == NEED_BACKTICK) {
+    sh_err("terminator: %s: syntax error: unexpected EOF while looking for matching '`'\n",
+           label);
+    return 2;
+  }
+  if (st == NEED_BACKSLASH) {
+    sh_err("terminator: %s: syntax error: unexpected EOF after trailing '\\'\n",
+           label);
+    return 2;
+  }
+
+  enum { CF_IF_COND = 1, CF_THEN_BODY = 2, CF_ELSE_BODY = 3 };
+  int stack[64];
+  int sp = 0;
+  int has_cmd = 0;
+  int at_cmd_start = 1;
+  size_t i = 0;
+
+  while (s[i]) {
+    while (s[i] == ' ' || s[i] == '\t')
+      i++;
+    if (!s[i])
+      break;
+    if (s[i] == '#') {
+      while (s[i] && s[i] != '\n')
+        i++;
+      continue;
+    }
+    if (s[i] == '\n' || s[i] == ';') {
+      at_cmd_start = 1;
+      i++;
+      continue;
+    }
+    if ((s[i] == '&' && s[i + 1] == '&') || (s[i] == '|' && s[i + 1] == '|')) {
+      at_cmd_start = 1;
+      i += 2;
+      continue;
+    }
+    if (s[i] == '|') {
+      at_cmd_start = 1;
+      i++;
+      continue;
+    }
+
+    size_t start = i;
+    while (s[i] && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' &&
+           s[i] != ';' && s[i] != '|' && s[i] != '&') {
+      if (s[i] == '\'') {
+        i++;
+        while (s[i] && s[i] != '\'')
+          i++;
+        if (s[i])
+          i++;
+      } else if (s[i] == '"') {
+        i++;
+        while (s[i] && s[i] != '"') {
+          if (s[i] == '\\' && s[i + 1])
+            i += 2;
+          else
+            i++;
+        }
+        if (s[i])
+          i++;
+      } else if (s[i] == '$' && s[i + 1] == '(') {
+        i += 2;
+        scan_unit(s, &i, 1);
+      } else if (s[i] == '`') {
+        i++;
+        scan_backtick(s, &i);
+      } else if (s[i] == '\\' && s[i + 1]) {
+        i += 2;
+      } else {
+        i++;
+      }
+    }
+
+    size_t len = i - start;
+    if (at_cmd_start && len > 0) {
+      if (len == 2 && strncmp(s + start, "if", 2) == 0) {
+        if (sp >= 64) {
+          sh_err("terminator: %s: syntax error: 'if' nesting too deep\n", label);
+          return 2;
+        }
+        stack[sp++] = CF_IF_COND;
+        has_cmd = 0;
+        at_cmd_start = 1;
+        continue;
+      } else if (len == 4 && strncmp(s + start, "then", 4) == 0) {
+        if (sp == 0 || stack[sp - 1] != CF_IF_COND || !has_cmd) {
+          sh_err("terminator: %s: syntax error near unexpected token 'then'\n",
+                 label);
+          return 2;
+        }
+        stack[sp - 1] = CF_THEN_BODY;
+        has_cmd = 0;
+        at_cmd_start = 1;
+        continue;
+      } else if (len == 4 && strncmp(s + start, "elif", 4) == 0) {
+        if (sp == 0 || stack[sp - 1] != CF_THEN_BODY) {
+          sh_err("terminator: %s: syntax error near unexpected token 'elif'\n",
+                 label);
+          return 2;
+        }
+        stack[sp - 1] = CF_IF_COND;
+        has_cmd = 0;
+        at_cmd_start = 1;
+        continue;
+      } else if (len == 4 && strncmp(s + start, "else", 4) == 0) {
+        if (sp == 0 || stack[sp - 1] != CF_THEN_BODY) {
+          sh_err("terminator: %s: syntax error near unexpected token 'else'\n",
+                 label);
+          return 2;
+        }
+        stack[sp - 1] = CF_ELSE_BODY;
+        has_cmd = 0;
+        at_cmd_start = 1;
+        continue;
+      } else if (len == 2 && strncmp(s + start, "fi", 2) == 0) {
+        if (sp == 0 ||
+            (stack[sp - 1] != CF_THEN_BODY && stack[sp - 1] != CF_ELSE_BODY)) {
+          sh_err("terminator: %s: syntax error near unexpected token 'fi'\n",
+                 label);
+          return 2;
+        }
+        sp--;
+        has_cmd = 1;
+        at_cmd_start = 0;
+        continue;
+      }
+      has_cmd = 1;
+      at_cmd_start = 0;
+    }
+  }
+
+  if (sp > 0) {
+    if (stack[sp - 1] == CF_IF_COND) {
+      sh_err("terminator: %s: syntax error: expected 'then'\n", label);
+    } else {
+      sh_err("terminator: %s: syntax error: expected 'fi'\n", label);
+    }
+    return 2;
+  }
+  return 0;
+}
+
 static int execute_script_text(const char *text) {
   size_t pos = 0;
   char *stmt = NULL;
@@ -2043,6 +2398,13 @@ static int run_script_file(const char *path, int argc, char **argv,
   size_t nread = fread(content, 1, (size_t)sz, f);
   content[nread] = '\0';
   fclose(f);
+
+  /* Validate syntax of the entire script upfront before executing any command */
+  if (validate_script_syntax(path, content) != 0) {
+    free(content);
+    last_status = 2;
+    return 2;
+  }
 
   /* Save previous positional parameters & state */
   int saved_argc = script_argc;
@@ -2329,8 +2691,17 @@ static int execute_single_line(const char *line) {
 
     if (strcmp(argv[0], "cd") == 0) {
       const char *dest = (argc > 1) ? argv[1] : getenv("HOME");
-      char path_buf[1024];
-      if (dest && strcmp(dest, "~") == 0) {
+      char path_buf[PATH_MAX];
+      if (dest && strcmp(dest, "-") == 0) {
+        if (!tab_oldpwd[0]) {
+          sh_err("terminator: cd: OLDPWD not set\n");
+          last_status = 1;
+          tok_free(&tl);
+          return last_status;
+        }
+        snprintf(path_buf, sizeof(path_buf), "%s", tab_oldpwd);
+        dest = path_buf;
+      } else if (dest && strcmp(dest, "~") == 0) {
         dest = getenv("HOME");
       } else if (dest && strncmp(dest, "~/", 2) == 0) {
         const char *home = getenv("HOME");
@@ -2667,7 +3038,56 @@ static void multiwatch_print(const char *cmd, const char *data, ssize_t len) {
   write_all(cur_stdout_fd, MW_SEPARATOR "\n", strlen(MW_SEPARATOR) + 1);
 }
 
-/* One pipe+fork per command, polled together; 0x03 on input kills all */
+static long monotonic_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static int spawn_multiwatch_child(const char *cmd, int all_fds[], int n_fds,
+                                  int *out_fd, pid_t *out_pid) {
+  int pp[2];
+  *out_fd = -1;
+  *out_pid = -1;
+  if (pipe(pp) < 0) {
+    sh_err("terminator: pipe: %s\n", strerror(errno));
+    return -1;
+  }
+  fflush(NULL);
+  pid_t pid = fork();
+  if (pid < 0) {
+    sh_err("terminator: fork: %s\n", strerror(errno));
+    close(pp[0]);
+    close(pp[1]);
+    return -1;
+  }
+  if (pid == 0) {
+    setpgid(0, 0);
+    close(pp[0]);
+    for (int j = 0; j < n_fds; j++) {
+      if (all_fds[j] >= 0)
+        close(all_fds[j]);
+    }
+    in_subshell = 1;
+    cur_stdout_fd = pp[1];
+    tab_out_fd = pp[1];
+    child_setup();
+    close(pp[1]);
+    cur_stdout_fd = STDOUT_FILENO;
+    tab_out_fd = STDOUT_FILENO;
+    execute_line(cmd);
+    _exit(last_status);
+  }
+  close(pp[1]);
+  setpgid(pid, pid);
+  *out_fd = pp[0];
+  *out_pid = pid;
+  return 0;
+}
+
+/* One pipe+fork per command, polled together; re-runs finished commands every
+ * 2s by default until Ctrl+C (0x03 on input or SIGINT) terminates all children
+ */
 static int multi_watch(const char *args) {
   char *cmds[MULTIWATCH_MAX];
   int n = 0;
@@ -2678,53 +3098,56 @@ static int multi_watch(const char *args) {
     return 2;
   }
 
+  long interval_ms = 2000; /* 2 seconds default per specification */
+  const char *env_int = getenv("MULTIWATCH_INTERVAL_MS");
+  if (env_int && *env_int) {
+    long v = atol(env_int);
+    if (v >= 0)
+      interval_ms = v;
+  }
+
   int fds[MULTIWATCH_MAX];
   pid_t pids[MULTIWATCH_MAX];
+  long next_run_ms[MULTIWATCH_MAX];
   int open_count = 0;
 
-  fflush(NULL);
   for (int i = 0; i < n; i++) {
-    int pp[2];
     fds[i] = -1;
     pids[i] = -1;
-    if (pipe(pp) < 0) {
-      sh_err("terminator: pipe: %s\n", strerror(errno));
-      continue;
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-      sh_err("terminator: fork: %s\n", strerror(errno));
-      close(pp[0]);
-      close(pp[1]);
-      continue;
-    }
-    if (pid == 0) {
-      setpgid(0, 0);
-      close(pp[0]);
-      for (int j = 0; j < i; j++) {
-        if (fds[j] >= 0)
-          close(fds[j]);
-      }
-      in_subshell = 1;
-      cur_stdout_fd = pp[1];
-      tab_out_fd = pp[1];
-      child_setup();
-      close(pp[1]);
-      cur_stdout_fd = STDOUT_FILENO;
-      tab_out_fd = STDOUT_FILENO;
-      execute_line(cmds[i]);
-      _exit(last_status);
-    }
-    close(pp[1]);
-    setpgid(pid, pid);
-    fds[i] = pp[0];
-    pids[i] = pid;
-    open_count++;
+    next_run_ms[i] = 0;
+  }
+
+  for (int i = 0; i < n; i++) {
+    if (spawn_multiwatch_child(cmds[i], fds, n, &fds[i], &pids[i]) == 0)
+      open_count++;
   }
 
   int cancelled = 0;
   int input_open = 1; /* stop watching the tab input once it hits EOF */
-  while (open_count > 0 && !cancelled) {
+  while (!cancelled) {
+    if (headless_sigint) {
+      headless_sigint = 0;
+      cancelled = 1;
+      break;
+    }
+
+    long now = monotonic_ms();
+    if (input_open && interval_ms > 0) {
+      for (int i = 0; i < n; i++) {
+        if (fds[i] < 0 && next_run_ms[i] > 0 && now >= next_run_ms[i]) {
+          if (spawn_multiwatch_child(cmds[i], fds, n, &fds[i], &pids[i]) == 0) {
+            open_count++;
+            next_run_ms[i] = 0;
+          } else {
+            next_run_ms[i] = now + interval_ms;
+          }
+        }
+      }
+    }
+
+    if (open_count == 0 && (!input_open || interval_ms == 0))
+      break;
+
     struct pollfd pf[MULTIWATCH_MAX + 1];
     int idx[MULTIWATCH_MAX];
     int np = 0;
@@ -2740,11 +3163,32 @@ static int multi_watch(const char *args) {
     pf[np].events = POLLIN;
     pf[np].revents = 0;
 
-    if (poll(pf, (nfds_t)(np + 1), -1) < 0) {
-      if (errno == EINTR)
+    int timeout_ms = 500;
+    if (input_open && interval_ms > 0) {
+      now = monotonic_ms();
+      for (int i = 0; i < n; i++) {
+        if (fds[i] < 0 && next_run_ms[i] > 0) {
+          long rem = next_run_ms[i] - now;
+          if (rem < 0)
+            rem = 0;
+          if (rem < timeout_ms)
+            timeout_ms = (int)rem;
+        }
+      }
+    }
+
+    if (poll(pf, (nfds_t)(np + 1), timeout_ms) < 0) {
+      if (errno == EINTR) {
+        if (headless_sigint) {
+          headless_sigint = 0;
+          cancelled = 1;
+          break;
+        }
         continue;
+      }
       break;
     }
+
     for (int k = 0; k < np; k++) {
       if (!(pf[k].revents & (POLLIN | POLLHUP | POLLERR)))
         continue;
@@ -2757,18 +3201,21 @@ static int multi_watch(const char *args) {
         close(fds[i]);
         fds[i] = -1;
         open_count--;
+        if (pids[i] > 0) {
+          waitpid(pids[i], NULL, 0);
+          pids[i] = -1;
+        }
+        next_run_ms[i] = monotonic_ms() + interval_ms;
       }
     }
+
     if (pf[np].revents & (POLLIN | POLLHUP | POLLERR)) {
-      char cb[64];
-      ssize_t got = read(tab_in_fd, cb, sizeof(cb));
+      char cb;
+      ssize_t got = read(tab_in_fd, &cb, 1);
       if (got <= 0) {
         input_open = 0;
-      } else {
-        for (ssize_t k = 0; k < got; k++) {
-          if (cb[k] == 3)
-            cancelled = 1;
-        }
+      } else if (cb == 3) {
+        cancelled = 1;
       }
     }
   }
@@ -2776,9 +3223,10 @@ static int multi_watch(const char *args) {
   for (int i = 0; i < n; i++) {
     if (fds[i] >= 0)
       close(fds[i]);
-    if (cancelled && pids[i] > 0) {
+    if (pids[i] > 0) {
       if (kill(-pids[i], SIGINT) < 0)
         kill(pids[i], SIGINT);
+      kill(-pids[i], SIGKILL);
     }
   }
   for (int i = 0; i < n; i++) {
@@ -3232,6 +3680,51 @@ static void init_default_bindings(void) {
   bindings[ACT_SCROLL_DOWN] = (KeyBinding){ShiftMask, XK_Page_Down};
 }
 
+static const char *action_name(ActionId act) {
+  switch (act) {
+  case ACT_MOVE_LEFT:
+    return "move-left";
+  case ACT_MOVE_RIGHT:
+    return "move-right";
+  case ACT_START_OF_LINE:
+    return "start-of-line";
+  case ACT_END_OF_LINE:
+    return "end-of-line";
+  case ACT_HIST_PREV:
+    return "browse-history-up";
+  case ACT_HIST_NEXT:
+    return "browse-history-down";
+  case ACT_DEL_TO_START:
+    return "delete-to-start";
+  case ACT_DEL_TO_END:
+    return "delete-to-end";
+  case ACT_DEL_WORD:
+    return "delete-word";
+  case ACT_CLEAR_SCREEN:
+    return "clear-screen";
+  case ACT_CLOSE_TAB:
+    return "close-tab";
+  case ACT_COPY:
+    return "copy";
+  case ACT_PASTE:
+    return "paste";
+  case ACT_SEARCH_HIST:
+    return "history-search";
+  case ACT_NEW_TAB:
+    return "new-tab";
+  case ACT_INTERRUPT:
+    return "interrupt";
+  case ACT_SUSPEND:
+    return "suspend";
+  case ACT_SCROLL_UP:
+    return "scroll-up";
+  case ACT_SCROLL_DOWN:
+    return "scroll-down";
+  default:
+    return "none";
+  }
+}
+
 static ActionId parse_action_name(const char *name) {
   if (strcasecmp(name, "move-left") == 0 ||
       strcasecmp(name, "backward-char") == 0)
@@ -3468,6 +3961,20 @@ static void load_config(const char *cli_path) {
               path, line_no, key_str);
       continue;
     }
+
+    int conflict = 0;
+    for (int other = 1; other < ACT_COUNT; other++) {
+      if (other != (int)act && bindings[other].mod == kb.mod &&
+          bindings[other].sym == kb.sym) {
+        fprintf(stderr,
+                "terminator: %s:%d: key '%s' for '%s' conflicts with '%s', keeping default\n",
+                path, line_no, key_str, act_str, action_name((ActionId)other));
+        conflict = 1;
+        break;
+      }
+    }
+    if (conflict)
+      continue;
 
     bindings[act] = kb;
     loaded_count++;
@@ -4503,6 +5010,10 @@ int main(int argc, char **argv) {
   fcntl(ConnectionNumber(dpy), F_SETFD, FD_CLOEXEC);
 
   scr = DefaultScreen(dpy);
+  xa_clipboard = XInternAtom(dpy, "CLIPBOARD", False);
+  xa_targets = XInternAtom(dpy, "TARGETS", False);
+  xa_utf8 = XInternAtom(dpy, "UTF8_STRING", False);
+  xa_sel_prop = XInternAtom(dpy, "TERMINATOR_SEL", False);
   col_bg = get_hex_color("#181825");
   col_tab_bar = get_hex_color("#11111b");
   col_tab_active_bg = get_hex_color("#313244");
@@ -4595,6 +5106,10 @@ int main(int argc, char **argv) {
                 if (end) {
                   *end = '\0';
                   snprintf(tabs[i].cwd, sizeof(tabs[i].cwd), "%s", p);
+                  char *slash = strrchr(p, '/');
+                  const char *bname = (slash && *(slash + 1)) ? slash + 1 : p;
+                  snprintf(tabs[i].title, sizeof(tabs[i].title), "%d: %s",
+                           tabs[i].id, bname);
                 }
               }
               redraw(win_w, win_h);
@@ -4648,6 +5163,80 @@ int main(int argc, char **argv) {
         redraw(win_w, win_h);
       } else if (ev.type == Expose) {
         redraw(win_w, win_h);
+      } else if (ev.type == SelectionRequest) {
+        XSelectionRequestEvent *req = &ev.xselectionrequest;
+        XSelectionEvent sev;
+        memset(&sev, 0, sizeof(sev));
+        sev.type = SelectionNotify;
+        sev.display = req->display;
+        sev.requestor = req->requestor;
+        sev.selection = req->selection;
+        sev.target = req->target;
+        sev.time = req->time;
+        sev.property = None;
+        Atom prop = (req->property == None) ? req->target : req->property;
+        if (req->target == xa_targets) {
+          Atom supported[3] = {XA_STRING, xa_utf8, xa_targets};
+          XChangeProperty(dpy, req->requestor, prop, XA_ATOM, 32,
+                          PropModeReplace, (unsigned char *)supported, 3);
+          sev.property = prop;
+        } else if (req->target == XA_STRING || req->target == xa_utf8) {
+          char clip[4096] = "";
+          if (shared_state) {
+            shared_lock();
+            snprintf(clip, sizeof(clip), "%s", shared_state->clipboard);
+            shared_unlock();
+          }
+          XChangeProperty(dpy, req->requestor, prop, req->target, 8,
+                          PropModeReplace, (unsigned char *)clip,
+                          (int)strlen(clip));
+          sev.property = prop;
+        }
+        XSendEvent(dpy, req->requestor, False, 0, (XEvent *)&sev);
+        XFlush(dpy);
+      } else if (ev.type == SelectionNotify) {
+        if (ev.xselection.property != None && active_tab >= 0 &&
+            active_tab < tab_count) {
+          Atom actual_type;
+          int actual_fmt;
+          unsigned long nitems = 0, bytes_after = 0;
+          unsigned char *prop_data = NULL;
+          if (XGetWindowProperty(dpy, win, ev.xselection.property, 0, 1024,
+                                 True, AnyPropertyType, &actual_type,
+                                 &actual_fmt, &nitems, &bytes_after,
+                                 &prop_data) == Success &&
+              prop_data) {
+            if (nitems > 0) {
+              Tab *cur = &tabs[active_tab];
+              size_t clen = 0;
+              char clean[4096];
+              for (unsigned long k = 0; k < nitems && clen < sizeof(clean) - 1;
+                   k++) {
+                unsigned char ch = prop_data[k];
+                if (ch >= 32 && ch <= 126)
+                  clean[clen++] = (char)ch;
+              }
+              clean[clen] = '\0';
+              if (clen > 0 && shared_state) {
+                shared_lock();
+                snprintf(shared_state->clipboard,
+                         sizeof(shared_state->clipboard), "%s", clean);
+                shared_unlock();
+              }
+              if (clen > 0 &&
+                  cur->input_len + (int)clen < (int)sizeof(cur->input) - 2) {
+                memmove(cur->input + cur->input_pos + clen,
+                        cur->input + cur->input_pos,
+                        cur->input_len - cur->input_pos + 1);
+                memcpy(cur->input + cur->input_pos, clean, clen);
+                cur->input_len += (int)clen;
+                cur->input_pos += (int)clen;
+                redraw(win_w, win_h);
+              }
+            }
+            XFree(prop_data);
+          }
+        }
       } else if (ev.type == ButtonPress) {
         int bx = ev.xbutton.x;
         int by = ev.xbutton.y;
@@ -5046,6 +5635,7 @@ int main(int argc, char **argv) {
             break;
           case ACT_COPY:
             if (shared_state) {
+              char clip_copy[4096] = "";
               shared_lock();
               if (cur->input_len > 0) {
                 snprintf(shared_state->clipboard,
@@ -5055,16 +5645,47 @@ int main(int argc, char **argv) {
                          sizeof(shared_state->clipboard), "%s",
                          cur->lines[cur->line_count - 1]);
               }
+              snprintf(clip_copy, sizeof(clip_copy), "%s",
+                       shared_state->clipboard);
               shared_unlock();
+              XStoreBytes(dpy, clip_copy, (int)strlen(clip_copy));
+              XSetSelectionOwner(dpy, XA_PRIMARY, win, CurrentTime);
+              if (xa_clipboard != None)
+                XSetSelectionOwner(dpy, xa_clipboard, win, CurrentTime);
+              XFlush(dpy);
             }
             break;
-          case ACT_PASTE:
+          case ACT_PASTE: {
             cur->scroll_offset = 0;
-            if (shared_state) {
+            Window cb_owner = (xa_clipboard != None)
+                                  ? XGetSelectionOwner(dpy, xa_clipboard)
+                                  : None;
+            Window pr_owner = XGetSelectionOwner(dpy, XA_PRIMARY);
+            if (cb_owner != None && cb_owner != win) {
+              XConvertSelection(dpy, xa_clipboard, XA_STRING, xa_sel_prop, win,
+                                CurrentTime);
+              XFlush(dpy);
+            } else if (pr_owner != None && pr_owner != win) {
+              XConvertSelection(dpy, XA_PRIMARY, XA_STRING, xa_sel_prop, win,
+                                CurrentTime);
+              XFlush(dpy);
+            } else if (shared_state) {
               shared_lock();
               char clip[4096];
               snprintf(clip, sizeof(clip), "%s", shared_state->clipboard);
               shared_unlock();
+              if (!clip[0]) {
+                int nbytes = 0;
+                char *xb = XFetchBytes(dpy, &nbytes);
+                if (xb && nbytes > 0) {
+                  size_t n = (size_t)nbytes < sizeof(clip) - 1
+                                 ? (size_t)nbytes
+                                 : sizeof(clip) - 1;
+                  memcpy(clip, xb, n);
+                  clip[n] = '\0';
+                  XFree(xb);
+                }
+              }
               size_t clen = strlen(clip);
               if (clen > 0 &&
                   cur->input_len + (int)clen < (int)sizeof(cur->input) - 2) {
@@ -5078,6 +5699,7 @@ int main(int argc, char **argv) {
               }
             }
             break;
+          }
           case ACT_SEARCH_HIST:
             cur->scroll_offset = 0;
             cur->searching = 1;

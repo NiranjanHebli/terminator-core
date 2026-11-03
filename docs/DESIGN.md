@@ -302,6 +302,7 @@ The `multiWatch ["cmd1", "cmd2", ...]` built-in runs multiple shell commands in 
   <chunk output>
   ----------------------------------------------------
   ```
+- Like `watch`, automatically re-runs each command after it finishes (every 2 seconds by default) using monotonic timer deadlines calculated directly into the `poll()` timeout (zero busy-waiting).
 - When `Ctrl+C` is pressed, the shell issues `SIGKILL`/`SIGINT` to all child process groups and cleanly returns to the prompt.
 
 ```mermaid
@@ -532,10 +533,11 @@ classDiagram
 ### 7.1 Parser, Quoting & Variable Expansion
 - **Quoting Rules:**
   - `'single'`: Completely literal; disables variable expansion, escape characters, and operators.
-  - `"double"`: Preserves whitespace; expands `$VAR`, `${VAR}`, `$?`, `$$`, and nested command substitution `$(...)`.
+  - `"double"`: Preserves whitespace; expands `$VAR`, `${VAR}`, `$?`, `$$`, and nested command substitution (`$(...)` and backticks `` `...` ``).
   - `\`: Escapes the subsequent character.
-- **Multiline Input (`input_status`):** If an input buffer contains an open quote, a trailing backslash, or an open `$(`, the shell and GUI present the continuation prompt `> ` and accumulate lines until syntax is complete.
-- **Command Substitution (`$(cmd)`):** Evaluated recursively from innermost to outermost. Spawns an internal subshell pipe, captures stdout into an in-memory buffer, strips trailing newlines, and splices the text into the command string.
+- **Multiline Input (`input_status`):** If an input buffer contains an open quote, a trailing backslash, an open `$(`, an open backtick `` ` ``, or an unclosed `if` block, the shell and GUI present the continuation prompt `> ` and accumulate lines until syntax is complete.
+- **Command Substitution (`$(cmd)` and `` `cmd` ``):** Evaluated recursively from innermost to outermost. Spawns an internal subshell pipe, captures stdout into an in-memory buffer, strips trailing newlines, and splices the text into the command string.
+- **Wildcard Glob Expansion (`*`, `?`):** Unquoted words containing `*` or `?` are matched against the tab's current directory (`tab_cwd`) via `opendir()` / `fnmatch()`, sorted lexicographically, and expanded into argument tokens before execution.
 
 ```mermaid
 flowchart TD
@@ -545,7 +547,7 @@ flowchart TD
     
     CONT -- "Yes" --> SUB["Command Substitution Engine\nEvaluate $(cmd) recursively"]
     SUB --> EXP["Variable Expansion Subsystem\nExpand $VAR, ${VAR}, $?, $$"]
-    EXP --> LEX["Tokenization & Quote Stripping\nPreserve quoted argument boundaries"]
+    EXP --> LEX["Tokenization, Quote Stripping &\nWildcard Glob Expansion (*, ?)"]
     LEX --> REDIR["Parse Redirections (<, >, >>)"]
     REDIR --> PIPE["Split Pipeline Stages (|)"]
     PIPE --> EXEC["Dispatch to Shell Execution Engine"]
@@ -565,14 +567,14 @@ flowchart TD
 Default bindings conform to standard readline:
 - Navigation: `Left` / `Right` (character), `Ctrl+A` (home), `Ctrl+E` (end)
 - Editing: `Ctrl+W` (delete word), `Ctrl+U` (delete to start), `Ctrl+K` (delete to end), `Ctrl+L` (clear screen)
-- Tabs & Clipboard: `Ctrl+T` (new tab), `Ctrl+D` (close tab / EOF), `Ctrl+Shift+C` (copy), `Ctrl+Shift+V` (paste)
+- Tabs & Clipboard: `Ctrl+T` (new tab), `Ctrl+D` (close tab / EOF), `Ctrl+Shift+C` (copy to shared memory and X11 `CLIPBOARD` / `XA_PRIMARY`), `Ctrl+Shift+V` (paste from X11 selection or shared memory)
 
 Bindings are fully configurable without recompilation via `~/.terminatorrc`:
 ```text
 bind clear-screen Ctrl+Shift+L
 bind delete-word Alt+Backspace
 ```
-Malformed or unrecognized binding lines log a warning on `stderr` and preserve default bindings.
+Malformed, unrecognized, or conflicting binding lines log a warning on `stderr` and preserve default bindings.
 
 ### 7.3 Persistent History & Reverse Search (`Ctrl+R`)
 - **Persistence:** Commands are appended to `~/.terminator_history` on submission and restored on launch (up to 10,000 commands).
@@ -620,6 +622,7 @@ flowchart TD
 
 ### 7.5 Native Shell Scripting Engine
 Terminator executes scripts (`./check.sh`, `bash check.sh`, `source check.sh`) natively without delegating to `/bin/bash`:
+- **Upfront Syntax Validation:** Before executing any statements in a script file, `validate_script_syntax()` verifies quote/subshell balance and `if` / `then` / `elif` / `else` / `fi` block structure, aborting with exit code `2` on syntax errors so invalid scripts never partially execute.
 - **Variables & Positional Parameters:** Handles assignment (`VAR=value`), positional parameters (`$1`..`$9`), argument count (`$#`), and status (`$?`).
 - **Control Flow:** Nested `if` / `elif` / `else` / `fi` blocks.
 - **`[` Test Expressions:** Evaluates file tests (`-f`, `-d`, `-e`), string tests (`=`, `!=`, `-z`, `-n`), and arithmetic comparisons (`-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`).
