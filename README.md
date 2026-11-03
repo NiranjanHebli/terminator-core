@@ -147,7 +147,9 @@ Reconfigures hotkeys on the fly without recompilation via custom configuration f
 
 Watch the complete feature walkthrough and live presentation of Terminator in action:
 
-- **Live Demonstration Video:** [Watch Video Demonstration](https://youtu.be/placeholder) *(Replace with your video link or local embed)*
+[![Watch the video](https://cdn.loom.com/sessions/thumbnails/262de7377c0645268e2bfeb6e6c15f2c-8040ac7f4fa8ce86.gif)](https://www.loom.com/share/262de7377c0645268e2bfeb6e6c15f2c)
+
+- **Live Demonstration Video:** [Watch Video Demonstration on Loom](https://www.loom.com/share/262de7377c0645268e2bfeb6e6c15f2c)
 
 ---
 
