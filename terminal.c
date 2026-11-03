@@ -567,11 +567,16 @@ static _Thread_local int tab_slot = -1; /* index into SharedState.fg_pgid */
 
 /* Foreground group for headless mode (--shell), which has no GUI */
 static volatile sig_atomic_t headless_fg_pgid = 0;
+static volatile sig_atomic_t headless_sigint = 0;
 
 static void forward_to_foreground(int sig) {
   pid_t g = headless_fg_pgid;
-  if (g > 1)
+  if (g > 1) {
     kill(-g, sig);
+  } else if (sig == SIGINT && isatty(STDIN_FILENO)) {
+    headless_sigint = 1;
+    write_all(STDOUT_FILENO, "\n", 1);
+  }
 }
 
 /* Publish this tab's foreground job (0 = none) for the GUI to find. */
@@ -2799,8 +2804,15 @@ static int read_line(LineReader *r, int fd, char *line, size_t cap,
   for (;;) {
     if (r->pos == r->len) {
       ssize_t got = read(fd, r->buf, sizeof(r->buf));
-      if (got < 0 && errno == EINTR)
+      if (got < 0 && errno == EINTR) {
+        if (headless_sigint) {
+          headless_sigint = 0;
+          line[0] = '\0';
+          *interrupted = 1;
+          return 0;
+        }
         continue;
+      }
       if (got <= 0) {
         if (n > 0) {
           line[n] = '\0';
@@ -2832,12 +2844,25 @@ static void run_shell(void) {
   LineReader rd = {.pos = 0, .len = 0};
   int interrupted = 0;
   int n;
+  int interactive_tty = (tab_slot < 0 && isatty(tab_in_fd));
 
   cmd[0] = '\0';
   set_tab_busy(0);
-  while (!shell_exit_requested &&
-         (n = read_line(&rd, tab_in_fd, line, sizeof(line), &interrupted)) >=
-             0) {
+  for (;;) {
+    if (shell_exit_requested)
+      break;
+    if (interactive_tty) {
+      if (cmd_len == 0)
+        reap_jobs();
+      const char *prompt = (cmd_len > 0) ? CONT_PROMPT : "user@terminator> ";
+      write_all(cur_stdout_fd, prompt, strlen(prompt));
+    }
+    n = read_line(&rd, tab_in_fd, line, sizeof(line), &interrupted);
+    if (n < 0) {
+      if (interactive_tty)
+        write_all(cur_stdout_fd, "\n", 1);
+      break;
+    }
     size_t len = (size_t)n;
     while (len > 0 && line[len - 1] == '\r')
       line[--len] = '\0';
@@ -2847,7 +2872,7 @@ static void run_shell(void) {
       set_tab_busy(0);
     }
     /* announce finished background jobs, but not mid multiline command */
-    if (cmd_len == 0)
+    if (cmd_len == 0 && !interactive_tty)
       reap_jobs();
     if (len == 0 && cmd_len == 0) {
       set_tab_busy(0);
@@ -4218,12 +4243,33 @@ static void redraw(int win_w, int win_h) {
 int main(int argc, char **argv) {
   /* ./terminator = thread mode, ./terminator useProcess=True = process */
   int headless = 0;
+  int print_hist_only = 0;
   for (int i = 1; i < argc; i++) {
     if (strncmp(argv[i], "useProcess=", 11) == 0) {
       const char *v = argv[i] + 11;
       use_process_mode = (strcasecmp(v, "true") == 0 || strcmp(v, "1") == 0);
+    } else if (strcmp(argv[i], "--process") == 0 ||
+               strcmp(argv[i], "-p") == 0) {
+      use_process_mode = 1;
+    } else if (strcmp(argv[i], "--thread") == 0 ||
+               strcmp(argv[i], "-t") == 0 ||
+               strcmp(argv[i], "useProcess=False") == 0 ||
+               strcmp(argv[i], "useProcess=0") == 0) {
+      use_process_mode = 0;
     } else if (strcmp(argv[i], "--shell") == 0) {
       headless = 1;
+    } else if (strcmp(argv[i], "--history") == 0) {
+      print_hist_only = 1;
+    } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+      printf("Usage: %s [OPTIONS]\n\n"
+             "Launch Modes:\n"
+             "  (default) | --thread | useProcess=False   Launch GUI with each tab as a POSIX thread\n"
+             "  --process | -p       | useProcess=True    Launch GUI with each tab as a forked child process\n"
+             "  --shell                                   Run shell engine on stdin/stdout (headless mode)\n"
+             "  --history                                 Print shared command history across all tabs\n"
+             "  --help    | -h                            Show this help message\n",
+             argv[0]);
+      return 0;
     }
   }
 
@@ -4236,6 +4282,11 @@ int main(int argc, char **argv) {
   history_init_path();
   history_load();
   load_config();
+
+  if (print_hist_only) {
+    print_history(STDOUT_FILENO);
+    return 0;
+  }
 
   /* Headless mode: run only the shell engine on stdin/stdout (for testing) */
   if (headless) {

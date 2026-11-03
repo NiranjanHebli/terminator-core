@@ -50,12 +50,22 @@ make clean
 
 ## Quick Start & Running Terminator
 
-Terminator provides two execution architectures presenting identical behaviors:
+Terminator provides two execution architectures presenting identical behaviors, as well as CLI utilities for headless mode and cross-tab history:
 
 ```bash
-./terminator                     # Thread mode (default, one process with POSIX worker threads)
-./terminator useProcess=True     # Process mode (multi-process with forked child tabs)
-./terminator --shell             # Headless test mode (runs shell engine on stdin/stdout, no X11)
+# Thread Mode (each tab runs as a POSIX thread in a single process):
+./terminator
+./terminator --thread            # (or -t / useProcess=False)
+
+# Process Mode (each tab runs as an isolated forked child process):
+./terminator --process           # (or -p / useProcess=True)
+
+# Headless Shell Mode (interactive TTY prompt or non-interactive piped stdin/stdout, no X11):
+./terminator --shell
+
+# Shared History & Help:
+./terminator --history           # Print shared command history across all tabs to stdout
+./terminator --help              # Show all launch options
 ```
 
 ---
@@ -125,37 +135,37 @@ cp sample.terminatorrc ~/.terminatorrc
 - Per-tab in-memory text buffer and interactive command-line editing with backspace and cursor.
 
 ### Command Execution Engine & Built-ins
-- **Command Lifecycle:** Spawns external binaries via `fork()` $\to$ `execvp()` $\to$ `waitpid()`.
+- **Command Lifecycle:** Spawns external binaries via `fork()` -> `execvp()` -> `waitpid()`.
 - **Built-in `cd`:** Changes directory with `chdir()` directly inside the tab shell, supporting `cd`, `cd ~`, `cd ..`, and relative/absolute paths.
 - **Built-in `exit`:** Gracefully exits tab process and frees pipe descriptors.
 - **Return Status Tracking (`$?`):** Tracks exit codes of commands and built-ins, expanding `$?` expressions (e.g., `echo $?`).
 - **Standard Error Integration:** Child `stderr` is multiplexed with `stdout`, routing error diagnostics (such as `command not found`) straight to the terminal window.
 
 ### Multiline Input, Quoting & Expansion
-- **Read until complete:** if a line ends with `\`, or leaves a `'…'`, `"…"` or `$(…)` open, the tab shows a `> ` continuation prompt and keeps reading. The same `input_status()` check is used by the shell and the GUI so they never disagree.
-- **Quoting:** `'single'` is fully literal, `"double"` keeps spaces but still expands `$VAR`, `$?` and `$(…)`, and `\` escapes the next character. `|`, `<`, `>` inside quotes are plain text.
-- **Expansion:** `$VAR`, `${VAR}`, `$?`, `$$` and nested `$(…)` (innermost first, run through the same engine in a child process). Unquoted results are word-split; quoted ones are not.
-- Example: `echo "Files in $(basename $(pwd)): $(ls | \` ⏎ `> wc -l)"`.
+- **Read until complete:** if a line ends with `\`, or leaves a `'...'`, `"..."` or `$(...)` open, the tab shows a `> ` continuation prompt and keeps reading. The same `input_status()` check is used by the shell and the GUI so they never disagree.
+- **Quoting:** `'single'` is fully literal, `"double"` keeps spaces but still expands `$VAR`, `$?` and `$(...)`, and `\` escapes the next character. `|`, `<`, `>` inside quotes are plain text.
+- **Expansion:** `$VAR`, `${VAR}`, `$?`, `$$` and nested `$(...)` (innermost first, run through the same engine in a child process). Unquoted results are word-split; quoted ones are not.
+- Example: `echo "Files in $(basename $(pwd)): $(ls | \` [Enter] `> wc -l)"`.
 - Not supported: backticks, globbing (`*.txt`), `&&`/`;`.
 
 ### Plumbing: I/O Redirection & Pipelines
 - **I/O Redirection (`<`, `>`, `>>`):** Rewired in child processes via `open()` and `dup2()` without affecting the shell descriptors. Operators work with or without spaces (`sort<in.txt>out.txt`); a missing target reports `syntax error`, an unopenable file reports the `errno` message and sets `$?` to 1, and a bare `> file` creates/truncates the file.
 - **Headless test mode:** `./terminator --shell` runs only the shell engine on stdin/stdout (no X11), e.g. `printf 'sort < in.txt > out.txt\n' | ./terminator --shell`.
-- **Multi-Stage Pipelines (`cmd1 | cmd2 | ... | cmdN`):** Creates $N - 1$ pipes for $N$ stages, properly wiring each command's stdout to the next command's stdin.
+- **Multi-Stage Pipelines (`cmd1 | cmd2 | ... | cmdN`):** Creates N - 1 pipes for N stages, properly wiring each command's stdout to the next command's stdin.
 - **Pipe Closure Rule:** Unused pipe ends are closed in each child and in the parent shell so readers receive `EOF`.
 - **Process Group Alignment (`setpgid`):** All pipeline children share a process group for unified signal dispatching.
 - **Reaping & Status:** Waits for all pipeline stages and captures the last command's return status in `$?`.
 
 ### Multi-Tab Concurrency: Tabs, Shared State & multiWatch
 - **Two execution modes, identical behaviour:**
-  - `./terminator` (default, **thread mode**): the process hosts one `pthread` per tab.
-  - `./terminator useProcess=True` (**process mode**): the GUI is the parent and each tab is a `fork()`ed child.
+  - `./terminator` / `./terminator --thread` (`-t`, `useProcess=False`, default **thread mode**): the process hosts one `pthread` per tab.
+  - `./terminator --process` (`-p`, `useProcess=True`, **process mode**): the GUI is the parent and each tab is a `fork()`ed child process.
   - In both modes a tab talks to the GUI through a pair of pipes, so the GUI code is the same.
 - **Per-tab state:** `$?`, working directory, input line and output buffer are private. State is thread-local in thread mode (`chdir()` is process-wide, so each tab tracks its own `cwd`, child processes `chdir()` to it before `exec`, and `cd` is resolved against it).
 - **Shared state (history, clipboard buffer):**
   - Thread mode: heap memory guarded by a `pthread_mutex_t`.
   - Process mode: `shm_open` + `mmap` guarded by a POSIX named semaphore (`sem_open`). Both names are unlinked immediately, so nothing is left behind.
-  - History is a ring of the last 10,000 commands. A command typed in one tab is available in every other tab via `history` and the Up/Down arrows.
+  - History is a ring of the last 10,000 commands. A command typed in one tab is available in every other tab via `history`, `history -s <term>`, `Ctrl+R`, the Up/Down arrows, or from the CLI via `./terminator --history`.
 - **`exit` is per tab:** it ends that tab's shell loop only, so a thread-mode tab can never take the whole app down.
 - **I/O multiplexing:** one `poll()` sleeps on the X11 connection and every tab's output pipe (near 0% CPU when idle).
 - **`multiWatch ["cmd1", "cmd2", ...]`:** one `pipe()` + `fork()` per command, each running through the normal shell engine (so pipes and redirection work inside), and a single `poll()` over all read ends. Output is printed as it arrives in the graded format:
@@ -182,7 +192,7 @@ There is no TTY, so the kernel never turns Ctrl+C / Ctrl+Z into signals. The GUI
 
 - **A job is one process group**, so a single signal reaches every stage of a pipeline (`sleep 100 | cat` stops and dies as one).
 - **Isolation:** only the active tab's foreground group is ever signalled. The GUI, other tabs and background jobs never receive it, and the GUI refuses to signal its own group. With nothing running, `Ctrl+C` just abandons the typed line (and still cancels `multiWatch`); `Ctrl+Z` does nothing.
-- **Foreground wait:** `waitpid(-pgid, …, WUNTRACED)` per job, so a stop is noticed as well as an exit. A stopped job goes into the tab's job table and prints `[1]+ Stopped sleep 100`; `$?` is `130` after `Ctrl+C` and `128+SIGTSTP` after `Ctrl+Z`.
+- **Foreground wait:** `waitpid(-pgid, ..., WUNTRACED)` per job, so a stop is noticed as well as an exit. A stopped job goes into the tab's job table and prints `[1]+ Stopped sleep 100`; `$?` is `130` after `Ctrl+C` and `128+SIGTSTP` after `Ctrl+Z`.
 - **Built-ins** (run inside the shell, like `cd`): `fg [%n]`, `bg [%n]` (print `sleep 100` / `[1]+ sleep 100 &`). `jobs` prints `[1]+  Stopped   sleep 100` and, like `history`, runs in a child so it can be piped. A bare `fg`/`bg` picks the most recent job.
 - **`cmd &`:** starts the job in its own group, prints `[1] <pid>` and returns to the prompt at once. Its stdin is `/dev/null` so it cannot steal the tab's keyboard. Finished jobs are announced before the next prompt (`[1]+ Done sleep 1`, `Exit N`, `Terminated`). A trailing `&` is the only supported form; `&` elsewhere is a syntax error, and a quoted `'&'` stays literal.
 - **Per-tab job table:** private to each tab (thread-local), as required by the sharing rules. Closing a tab hangs up whatever it left running or stopped.
@@ -197,9 +207,9 @@ There is no TTY, so the kernel never turns Ctrl+C / Ctrl+Z into signals. The GUI
 
 | Action | Default Key | Description |
 | :--- | :--- | :--- |
-| Move in line | `←` / `→` | Move cursor backward / forward |
+| Move in line | `Left` / `Right` | Move cursor backward / forward |
 | Line bounds | `Ctrl+A` / `Ctrl+E` | Jump to start / end of line |
-| History navigation | `↑` / `↓` | Recall previous / next commands from shared history |
+| History navigation | `Up` / `Down` | Recall previous / next commands from shared history |
 | Delete to bounds | `Ctrl+U` / `Ctrl+K` | Delete from cursor to start / end of line |
 | Delete word | `Ctrl+W` | Delete word before cursor |
 | Clear screen | `Ctrl+L` | Clear tab display buffer |
@@ -220,6 +230,9 @@ bind delete-word Alt+Backspace
 #### Persistent History & Reverse Search
 - **Persistent storage:** history is saved to `~/.terminator_history` (or `$TERMINATOR_HISTFILE`), storing up to 10,000 commands across restarts.
 - **Shared across tabs:** commands entered in any tab are immediately appended to disk and visible to all tabs (both thread and process modes).
+- **Viewing & searching history:**
+  - Inside any tab: run `history` (supports piping/redirection, e.g., `history | grep ls`), `history -s <term>`, or use the `Up` / `Down` arrow keys.
+  - From the CLI: run `./terminator --history` to print the shared command history across all tabs.
 - **`Ctrl+R` Reverse Search:** prompts `Enter search term: ` with prioritized matching rules:
   1. Exact match: displays the most recent matching command.
   2. Longest common substring match: displays commands sharing the longest substring if longer than 2 characters.
@@ -247,7 +260,7 @@ bind delete-word Alt+Backspace
 - **Real-time command validation:** Command token is colored green (`#a6e3a1`) if recognized and red/pink (`#f38ba8`) if invalid.
 - **Quote styling:** Single and double-quoted strings are highlighted in peach (`#fab387`).
 - **Fish-style ghost suggestions:** Automatically renders matching command tails from history in dimmed gray ahead of the cursor.
-- **Right Arrow acceptance:** Pressing `→` at the end of the input line instantly accepts the ghost suggestion.
+- **Right Arrow acceptance:** Pressing `Right Arrow` at the end of the input line instantly accepts the ghost suggestion.
 
 #### Background Tab Activity Badges & Audio Alerts
 - **Unread notification dot:** When a background tab produces output or completes a running task, a colored notification badge appears on its tab bar.
